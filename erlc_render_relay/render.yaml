@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: brisbane-erlc-relay
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /
+    envVars:
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
