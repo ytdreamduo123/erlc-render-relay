@@ -23,6 +23,7 @@ ERLC_PUBLIC_KEY = (
     "MCowBQYDK2VwAyEAjSICb9pp0kHizGQtdG8ySWsDChfGqi+gyFCttigBNOA="
 )
 PUBLIC_KEY = serialization.load_der_public_key(base64.b64decode(ERLC_PUBLIC_KEY))
+ERLC_SERVER_URL = "https://api.erlc.gg/v2/server"
 
 
 def verified_request() -> tuple[bool, bytes]:
@@ -119,6 +120,39 @@ def event_records(payload: dict) -> list[dict]:
     return [payload]
 
 
+def live_location(player: str) -> str:
+    """Get the current in-game location for a named player, when configured."""
+    server_key = os.getenv("ERLC_SERVER_KEY", "").strip()
+    if not server_key or not player or player == "Unknown":
+        return "Location unavailable."
+    try:
+        response = requests.get(
+            ERLC_SERVER_URL,
+            headers={"server-key": server_key},
+            params={"Players": "true"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        players = response.json().get("Players", [])
+    except (requests.RequestException, ValueError, AttributeError):
+        return "Location unavailable."
+
+    wanted = player.casefold()
+    for entry in players:
+        if not isinstance(entry, dict):
+            continue
+        in_game_name = str(entry.get("Player") or "").rsplit(":", 1)[0]
+        if in_game_name.casefold() != wanted:
+            continue
+        location = entry.get("Location") or {}
+        postal = location.get("PostalCode") or "Unknown postal"
+        street = " ".join(
+            str(value) for value in (location.get("BuildingNumber"), location.get("StreetName")) if value
+        ) or "Unknown street"
+        return f"Postal: `{postal}`\nStreet: {street}"
+    return "Player is not currently in the ER:LC server."
+
+
 def event_embed(record: dict) -> dict:
     event_type = find_value(record, "event", "type", "eventType", "event_type", default="ER:LC Event")
     details = record.get("data") if isinstance(record.get("data"), dict) else record
@@ -147,6 +181,19 @@ def event_embed(record: dict) -> dict:
     message = find_value(
         details, "message", "content", "text", "reason", "command", default="No message supplied."
     )
+    if message.casefold().startswith(";000"):
+        reason = message[4:].strip() or "No reason provided."
+        return {
+            "title": "ER:LC 000 Alert",
+            "color": 0xD83C3E,
+            "fields": [
+                {"name": "Player", "value": player[:1024], "inline": True},
+                {"name": "Reason", "value": reason[:1024], "inline": False},
+                {"name": "Live Location", "value": live_location(player), "inline": False},
+            ],
+            "footer": {"text": "ER:LC Event Webhook"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
     if message == "No message supplied." and details:
         message = json.dumps(details, ensure_ascii=False, separators=(",", ":"))[:1000]
     return {
