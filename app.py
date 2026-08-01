@@ -87,6 +87,7 @@ def discord_embed(data: dict) -> dict:
         "command",
         default="No message supplied.",
     )
+    payload_preview = json.dumps(data, ensure_ascii=False, separators=(",", ":"))[:950]
     return {
         "username": "Brisbane Roleplay • ER:LC",
         "embeds": [
@@ -97,6 +98,11 @@ def discord_embed(data: dict) -> dict:
                     {"name": "Event", "value": event_type[:1024], "inline": True},
                     {"name": "Player", "value": player[:1024], "inline": True},
                     {"name": "Message", "value": message[:1024], "inline": False},
+                    {
+                        "name": "Event data (temporary)",
+                        "value": f"```json\n{payload_preview}\n```",
+                        "inline": False,
+                    },
                 ],
                 "footer": {"text": "ER:LC Event Webhook"},
                 "timestamp": datetime.now(timezone.utc).isoformat(),
