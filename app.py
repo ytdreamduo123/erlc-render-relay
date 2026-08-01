@@ -42,19 +42,51 @@ def verified_request() -> tuple[bool, bytes]:
         return False, body
 
 
-def first_value(data: dict, *names: str, default: str = "Unknown") -> str:
-    """Read a useful value despite small event-payload field-name changes."""
-    for name in names:
-        value = data.get(name)
-        if value not in (None, ""):
-            return str(value)
+def find_value(data: object, *names: str, default: str = "Unknown") -> str:
+    """Find event values across nested and differently-capitalised payloads."""
+    wanted = {name.casefold() for name in names}
+
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if str(key).casefold() in wanted and value not in (None, ""):
+                if isinstance(value, dict):
+                    return find_value(value, "username", "name", "displayname", default=default)
+                return str(value)
+
+        for value in data.values():
+            result = find_value(value, *names, default="")
+            if result:
+                return result
+    elif isinstance(data, list):
+        for value in data:
+            result = find_value(value, *names, default="")
+            if result:
+                return result
+
     return default
 
 
 def discord_embed(data: dict) -> dict:
-    event_type = first_value(data, "type", "eventType", "event_type", default="ER:LC Event")
-    player = first_value(data, "playerName", "player", "username", "sender", "author")
-    message = first_value(data, "message", "content", "text", "reason", default="No message supplied.")
+    event_type = find_value(data, "type", "eventType", "event_type", "event", default="ER:LC Event")
+    player = find_value(
+        data,
+        "playerName",
+        "player",
+        "username",
+        "sender",
+        "author",
+        "name",
+        default="Unknown",
+    )
+    message = find_value(
+        data,
+        "message",
+        "content",
+        "text",
+        "reason",
+        "command",
+        default="No message supplied.",
+    )
     return {
         "username": "Brisbane Roleplay • ER:LC",
         "embeds": [
