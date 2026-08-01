@@ -111,6 +111,64 @@ def discord_embed(data: dict) -> dict:
     }
 
 
+def event_records(payload: dict) -> list[dict]:
+    """ER:LC batches events in an `events` list; handle older single events too."""
+    records = payload.get("events")
+    if isinstance(records, list):
+        return [record for record in records if isinstance(record, dict)]
+    return [payload]
+
+
+def event_embed(record: dict) -> dict:
+    event_type = find_value(record, "event", "type", "eventType", "event_type", default="ER:LC Event")
+    details = record.get("data") if isinstance(record.get("data"), dict) else record
+
+    if event_type == "EmergencyCallStarted":
+        description = find_value(details, "description", default="No description supplied.")
+        location = find_value(details, "positionDescriptor", "location", default="Unknown location")
+        team = find_value(details, "team", default="Unknown")
+        call_number = find_value(details, "callNumber", default="Unknown")
+        return {
+            "title": "ER:LC Emergency Call",
+            "color": 0xE67E22,
+            "fields": [
+                {"name": "Call", "value": f"#{call_number}", "inline": True},
+                {"name": "Department", "value": team[:1024], "inline": True},
+                {"name": "Location", "value": location[:1024], "inline": False},
+                {"name": "Details", "value": description[:1024], "inline": False},
+            ],
+            "footer": {"text": "ER:LC Event Webhook"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    player = find_value(
+        details, "playerName", "player", "username", "sender", "author", "name", default="Unknown"
+    )
+    message = find_value(
+        details, "message", "content", "text", "reason", "command", default="No message supplied."
+    )
+    if message == "No message supplied." and details:
+        message = json.dumps(details, ensure_ascii=False, separators=(",", ":"))[:1000]
+    return {
+        "title": "ER:LC Event Received",
+        "color": 0x2B6CB0,
+        "fields": [
+            {"name": "Event", "value": event_type[:1024], "inline": True},
+            {"name": "Player", "value": player[:1024], "inline": True},
+            {"name": "Message", "value": message[:1024], "inline": False},
+        ],
+        "footer": {"text": "ER:LC Event Webhook"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def discord_payload(data: dict) -> dict:
+    return {
+        "username": "Brisbane Roleplay - ER:LC",
+        "embeds": [event_embed(record) for record in event_records(data)[:10]],
+    }
+
+
 @app.get("/")
 def health_check():
     return jsonify(status="online", service="erlc-event-relay")
@@ -136,7 +194,7 @@ def erlc_events():
         return jsonify(error="Discord webhook is not configured."), 503
 
     try:
-        result = requests.post(webhook_url, json=discord_embed(event), timeout=10)
+        result = requests.post(webhook_url, json=discord_payload(event), timeout=10)
         result.raise_for_status()
     except requests.RequestException:
         app.logger.exception("Unable to post ER:LC event to Discord.")
