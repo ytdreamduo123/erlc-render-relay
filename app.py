@@ -325,11 +325,66 @@ def event_embed(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | N
     }, None
 
 
+def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | None]:
+    """Build a Components V2 dispatch card for a phone emergency call."""
+    details = record.get("data") if isinstance(record.get("data"), dict) else {}
+    description = find_value(details, "description", default="No details provided.")
+    location = find_value(details, "positionDescriptor", "location", default="Unknown location")
+    team = find_value(details, "team", default="Emergency Services")
+    call_number = find_value(details, "callNumber", default="Unknown")
+    caller = find_value(details, "caller", "player", "playerName", "username", default="Anonymous caller")
+    try:
+        call_x, call_z = (float(value) for value in details.get("position", [])[:2])
+    except (TypeError, ValueError):
+        call_x = call_z = 0.0
+    units = nearby_police(players, call_x, call_z) if call_x or call_z else []
+    unit_text = "\n".join(
+        f"**{player_display_name(unit)}** — {unit.get('Callsign') or 'No callsign'} • {distance:.0f}m away"
+        for distance, unit in units
+    ) or "*No nearby police units found.*"
+    timestamp = int(record.get("timestamp") or datetime.now(timezone.utc).timestamp())
+    map_image = emergency_map(call_x, call_z, units) if call_x or call_z else None
+
+    card_components = [
+        {"type": 10, "content": f"## 911 Call Received: {team}"},
+        {
+            "type": 10,
+            "content": (
+                f"**📞 Caller:** {caller}\n"
+                f"**📋 Incident:** {description}\n"
+                f"**📍 Location:** {location}\n"
+                f"**🕒 Time:** <t:{timestamp}:F>"
+            ),
+        },
+        {"type": 14, "spacing": 1, "divider": True},
+        {"type": 10, "content": f"**🛡️ Closest Units**\n{unit_text}"},
+        {"type": 14, "spacing": 1, "divider": True},
+    ]
+    if map_image:
+        card_components.append(
+            {
+                "type": 12,
+                "items": [{"media": {"url": "attachment://erlc_emergency_map.png"}}],
+            }
+        )
+        card_components.append({"type": 14, "spacing": 1, "divider": True})
+    card_components.append({"type": 10, "content": "-# Brisbane Roleplay • 911 Emergency Dispatch"})
+
+    return {
+        "username": "Brisbane Roleplay - ER:LC",
+        "flags": 32768,
+        "components": [{"type": 17, "components": card_components}],
+    }, map_image
+
+
 def discord_payload(data: dict) -> tuple[dict, io.BytesIO | None]:
     players = server_players()
+    records = event_records(data)[:10]
+    if len(records) == 1 and find_value(records[0], "event", default="") == "EmergencyCallStarted":
+        return emergency_component_payload(records[0], players)
     map_image: io.BytesIO | None = None
     embeds = []
-    for record in event_records(data)[:10]:
+    for record in records:
         embed, rendered_map = event_embed(record, players)
         embeds.append(embed)
         map_image = map_image or rendered_map
