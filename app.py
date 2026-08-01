@@ -229,8 +229,11 @@ def emergency_map(call_x: float, call_z: float, units: list[tuple[float, dict]])
     call_point = map_point(call_x, call_z)
     crop_size = 620
     half = crop_size // 2
-    left = max(0, min(image.width - crop_size, call_point[0] - half))
-    top = max(0, min(image.height - crop_size, call_point[1] - half))
+    # Keep the crop inside the actual ER:LC map, not the white transparent
+    # border around the supplied map PNG.
+    map_left, map_top, map_right, map_bottom = MAP_BOUNDS
+    left = max(map_left, min(map_right - crop_size, call_point[0] - half))
+    top = max(map_top, min(map_bottom - crop_size, call_point[1] - half))
     cropped = image.crop((left, top, left + crop_size, top + crop_size)).resize((900, 900), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(cropped)
     scale = 900 / crop_size
