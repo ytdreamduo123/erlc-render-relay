@@ -42,9 +42,9 @@ MAP_Y_OFFSET = float(os.getenv("ERLC_MAP_Y_OFFSET", "-141.0"))
 # player phone calls.  This avoids a small interpolation error at those sites.
 LOCATION_MAP_ANCHORS = {
     "civilian spawn": (291, 822),
-    "police": (492, 666),
-    "police station": (492, 666),
-    "pd": (492, 666),
+    "police": (499, 640),
+    "police station": (499, 640),
+    "pd": (499, 640),
 }
 
 
