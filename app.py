@@ -332,9 +332,9 @@ def nearby_units(players: list[dict], call_x: float, call_z: float, call_team: s
 def map_window(image: Image.Image, call_point: tuple[int, int], bounds: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     """Choose a call-containing crop with the least white area from the map edge."""
     map_left, map_top, map_right, map_bottom = bounds
-    # A tighter crop keeps the caller and on-screen responders easy to read.
-    crop_width = min(460, map_right - map_left)
-    crop_height = min(460, map_bottom - map_top)
+    # A compact landscape crop fits Discord's dispatch container cleanly.
+    crop_width = min(520, map_right - map_left)
+    crop_height = min(300, map_bottom - map_top)
     candidates: list[tuple[int, int]] = []
     for x_anchor in (0.2, 0.5, 0.8):
         for y_anchor in (0.2, 0.5, 0.8):
@@ -392,10 +392,13 @@ def emergency_map(
     visible_bounds = map_bounds(image)
     call_point = map_point(call_x, call_z, visible_bounds, location_name)
     left, top, crop_width, crop_height = map_window(image, call_point, visible_bounds)
-    cropped = image.crop((left, top, left + crop_width, top + crop_height)).resize((900, 900), Image.Resampling.LANCZOS)
+    output_width, output_height = 900, 500
+    cropped = image.crop((left, top, left + crop_width, top + crop_height)).resize(
+        (output_width, output_height), Image.Resampling.LANCZOS
+    )
     draw = ImageDraw.Draw(cropped)
-    scale_x = 900 / crop_width
-    scale_y = 900 / crop_height
+    scale_x = output_width / crop_width
+    scale_y = output_height / crop_height
 
     def screen_point(point: tuple[int, int]) -> tuple[float, float]:
         return (point[0] - left) * scale_x, (point[1] - top) * scale_y
@@ -415,8 +418,8 @@ def emergency_map(
             draw.line((unit_screen[0], unit_screen[1], call_screen[0], call_screen[1]), fill="#2878F0", width=4)
             marker(unit_point, "#2878F0", 12)
             unit_label = player_display_name(unit)[:24]
-            unit_label_x = max(12, min(700, unit_screen[0] + 18))
-            unit_label_y = max(12, min(875, unit_screen[1] - 14))
+            unit_label_x = max(12, min(output_width - 180, unit_screen[0] + 18))
+            unit_label_y = max(12, min(output_height - 20, unit_screen[1] - 14))
             draw.text(
                 (unit_label_x, unit_label_y),
                 unit_label,
@@ -428,8 +431,8 @@ def emergency_map(
     marker(call_point, "#E53935", 18)
     label = caller_name if caller_name and caller_name != "Anonymous caller" else "Emergency Call"
     label = label[:32]
-    label_x = max(12, min(680, (call_point[0] - left) * scale_x + 24))
-    label_y = max(12, min(860, (call_point[1] - top) * scale_y - 12))
+    label_x = max(12, min(output_width - 180, (call_point[0] - left) * scale_x + 24))
+    label_y = max(12, min(output_height - 20, (call_point[1] - top) * scale_y - 12))
     draw.text(
         (label_x, label_y),
         label,
@@ -535,9 +538,9 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
     units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
     units = visible_map_units(call_x, call_z, units, location) if call_x or call_z else units
     unit_text = "\n".join(
-        f"**{player_display_name(unit)}** — {unit.get('Callsign') or 'No callsign'} • {distance:.0f}m away"
-        for distance, unit in units
-    ) or f"*No {nearby_heading.casefold()} found.*"
+        f"{player_display_name(unit)} - Postal {str((unit.get('Location') or {}).get('PostalCode') or 'Unknown')}"
+        for _, unit in units
+    ) or "*No nearby units are visible on the map.*"
     timestamp = int(record.get("timestamp") or datetime.now(timezone.utc).timestamp())
     app.logger.warning(
         "Map calibration: %s at ER:LC coordinates X=%s, Z=%s (%s).",
@@ -548,21 +551,20 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
     )
     map_image = emergency_map(call_x, call_z, units, caller, location) if call_x or call_z else None
 
-    call_heading = "911 Call Closed" if event_name == "EmergencyCallEnded" else "911 Call Received"
+    call_heading = "000 Call Closed" if event_name == "EmergencyCallEnded" else "000 Call Recieved"
     card_components = [
-        {"type": 10, "content": f"## {call_heading}: {team}"},
+        {"type": 10, "content": f"# {call_heading}: {team}"},
+        {"type": 14, "spacing": 1, "divider": True},
         {
             "type": 10,
             "content": (
-                f"**📞 Caller:** {caller}\n"
-                f"**📋 Incident:** {description}\n"
-                f"**📍 Location:** {location}\n"
-                f"**🕒 Time:** <t:{timestamp}:F>"
+                f"**<:ID1:1533361223922614292> Caller:** {caller}\n"
+                f"**<:rules:1516634223711092826> Incident:** {description}\n"
+                f"**<:location:1533361529783848960> Location:** {location}"
             ),
         },
         {"type": 14, "spacing": 1, "divider": True},
-        {"type": 10, "content": f"**🛡️ Closest Units**\n{unit_text}"},
-        {"type": 14, "spacing": 1, "divider": True},
+        {"type": 10, "content": f"<:walkietalkie:1530913722376257636> **Nearby Units:**\n{unit_text}"},
     ]
     if map_image:
         card_components.append(
@@ -572,7 +574,8 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
             }
         )
         card_components.append({"type": 14, "spacing": 1, "divider": True})
-    card_components.append({"type": 10, "content": "-# Brisbane Roleplay • 911 Emergency Dispatch"})
+    card_components.append({"type": 14, "spacing": 1, "divider": True})
+    card_components.append({"type": 10, "content": "-# Brisbane City Communication - 000 Emergency Dispatch"})
 
     return {
         "username": "Brisbane Roleplay - ER:LC",
