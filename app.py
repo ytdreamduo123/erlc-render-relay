@@ -34,10 +34,10 @@ MAP_FILE = Path(__file__).with_name("erlc_map.png")
 # These turn the API's LocationX/LocationZ values into pixels on the supplied
 # 1600x1600 ER:LC map image. They can be overridden in Render after a future
 # ER:LC map expansion without changing code.
-MAP_X_SCALE = float(os.getenv("ERLC_MAP_X_SCALE", "0.3450"))
-MAP_X_OFFSET = float(os.getenv("ERLC_MAP_X_OFFSET", "-128.9"))
-MAP_Y_SCALE = float(os.getenv("ERLC_MAP_Y_SCALE", "0.2485"))
-MAP_Y_OFFSET = float(os.getenv("ERLC_MAP_Y_OFFSET", "54.6"))
+MAP_X_SCALE = float(os.getenv("ERLC_MAP_X_SCALE", "0.2890"))
+MAP_X_OFFSET = float(os.getenv("ERLC_MAP_X_OFFSET", "-76.4"))
+MAP_Y_SCALE = float(os.getenv("ERLC_MAP_Y_SCALE", "0.4549"))
+MAP_Y_OFFSET = float(os.getenv("ERLC_MAP_Y_OFFSET", "-442.2"))
 
 
 def map_bounds(image: Image.Image) -> tuple[int, int, int, int]:
