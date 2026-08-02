@@ -179,7 +179,7 @@ def live_location(player: str) -> str:
             ERLC_SERVER_URL,
             headers={"server-key": server_key},
             params={"Players": "true"},
-            timeout=8,
+            timeout=4,
         )
         response.raise_for_status()
         players = response.json().get("Players", [])
@@ -212,7 +212,7 @@ def server_players() -> list[dict]:
             ERLC_SERVER_URL,
             headers={"server-key": server_key},
             params={"Players": "true"},
-            timeout=8,
+            timeout=4,
         )
         response.raise_for_status()
         players = response.json().get("Players", [])
@@ -231,6 +231,18 @@ def emergency_caller_name(details: dict, players: list[dict]) -> str:
     if supplied and not supplied.isdigit():
         return supplied
 
+    # Some ER:LC player call events include the caller directly in `players`.
+    # Use it immediately instead of waiting for the active-call endpoint.
+    event_players = details.get("players")
+    if isinstance(event_players, list):
+        for player in event_players:
+            if isinstance(player, dict):
+                name = find_value(player, "username", "player", "playerName", "name", default="")
+                if name and not name.isdigit():
+                    return name
+            elif isinstance(player, str) and player and not player.isdigit():
+                return player
+
     call_number = str(details.get("callNumber") or "")
     server_key = os.getenv("ERLC_SERVER_KEY", "").strip()
     if not server_key or not call_number:
@@ -244,7 +256,7 @@ def emergency_caller_name(details: dict, players: list[dict]) -> str:
                 ERLC_SERVER_URL,
                 headers={"server-key": server_key},
                 params={"EmergencyCalls": "true"},
-                timeout=8,
+                timeout=4,
             )
             response.raise_for_status()
             calls = response.json().get("EmergencyCalls", [])
@@ -261,7 +273,7 @@ def emergency_caller_name(details: dict, players: list[dict]) -> str:
             if caller_id.isdigit():
                 try:
                     roblox_response = requests.get(
-                        f"https://users.roblox.com/v1/users/{caller_id}", timeout=8
+                        f"https://users.roblox.com/v1/users/{caller_id}", timeout=4
                     )
                     roblox_response.raise_for_status()
                     username = roblox_response.json().get("name")
@@ -443,7 +455,9 @@ def emergency_map(
     )
 
     output = io.BytesIO()
-    cropped.save(output, format="PNG", optimize=True)
+    # JPEG is much smaller than a PNG photo-style map, so dispatch posts arrive
+    # noticeably faster without reducing the readable map detail.
+    cropped.convert("RGB").save(output, format="JPEG", quality=88, optimize=True)
     output.seek(0)
     return output
 
@@ -521,7 +535,9 @@ def event_embed(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | N
     }, None
 
 
-def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | None]:
+def emergency_component_payload(
+    record: dict, players: list[dict], caller_name: str | None = None
+) -> tuple[dict, io.BytesIO | None]:
     """Build a Components V2 dispatch card for a phone emergency call."""
     details = record.get("data") if isinstance(record.get("data"), dict) else {}
     event_name = find_value(record, "event", "type", "eventType", "event_type", default="")
@@ -529,7 +545,7 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
     location = find_value(details, "positionDescriptor", "location", default="Unknown location")
     team = find_value(details, "team", default="Emergency Services")
     call_number = find_value(details, "callNumber", default="Unknown")
-    caller = emergency_caller_name(details, players)
+    caller = caller_name or emergency_caller_name(details, players)
     nearby_heading, _ = dispatch_unit_filter(team)
     try:
         call_x, call_z = (float(value) for value in details.get("position", [])[:2])
@@ -570,7 +586,7 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
         card_components.append(
             {
                 "type": 12,
-                "items": [{"media": {"url": "attachment://erlc_emergency_map.png"}}],
+            "items": [{"media": {"url": "attachment://erlc_emergency_map.jpg"}}],
             }
         )
         card_components.append({"type": 14, "spacing": 1, "divider": True})
@@ -595,9 +611,9 @@ def discord_payload(data: dict) -> tuple[dict | None, io.BytesIO | None]:
         details = record.get("data") if isinstance(record.get("data"), dict) else {}
         caller = emergency_caller_name(details, players)
         if caller != "Anonymous caller":
-            return emergency_component_payload(record, players)
-        app.logger.info(
-            "Ignored EmergencyCallStarted #%s because ER:LC did not provide a real caller ID.",
+            return emergency_component_payload(record, players, caller)
+        app.logger.warning(
+            "Skipped EmergencyCallStarted #%s: ER:LC did not expose a player caller yet.",
             details.get("callNumber", "unknown"),
         )
     return None, None
@@ -618,7 +634,7 @@ def post_to_discord(
             return requests.post(
                 webhook_endpoint,
                 data={"payload_json": json.dumps(payload)},
-                files={"files[0]": ("erlc_emergency_map.png", map_image, "image/png")},
+                files={"files[0]": ("erlc_emergency_map.jpg", map_image, "image/jpeg")},
                 timeout=15,
             )
         return requests.post(webhook_endpoint, json=payload, timeout=10)
