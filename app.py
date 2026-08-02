@@ -661,6 +661,7 @@ def erlc_events():
         if payload is None:
             # A webhook was valid but it was an automated ER:LC event, a closed
             # call, or a probe.  Accept it without posting anything to Discord.
+            app.logger.info("Accepted an ER:LC event but did not post it: not a real player 911 call.")
             return Response(status=204)
         result = post_to_discord(webhook_url, payload, map_image)
         if not result.ok:
@@ -670,6 +671,7 @@ def erlc_events():
                 result.text[:2000],
             )
         result.raise_for_status()
+        app.logger.info("Posted a real player 911 call to Discord successfully.")
     except requests.RequestException:
         app.logger.exception("Unable to post ER:LC event to Discord.")
         return jsonify(error="Unable to deliver the event to Discord."), 502
