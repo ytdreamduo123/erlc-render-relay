@@ -154,6 +154,12 @@ def event_records(payload: dict) -> list[dict]:
     return [payload]
 
 
+def is_emergency_call_event(record: dict) -> bool:
+    """Return whether a webhook record is the start or end of an ER:LC call."""
+    event_name = find_value(record, "event", "type", "eventType", "event_type", default="")
+    return event_name in {"EmergencyCallStarted", "EmergencyCallEnded"}
+
+
 def live_location(player: str) -> str:
     """Get the current in-game location for a named player, when configured."""
     server_key = os.getenv("ERLC_SERVER_KEY", "").strip()
@@ -210,6 +216,38 @@ def player_display_name(player: dict) -> str:
     return str(player.get("Player") or "Unknown").rsplit(":", 1)[0]
 
 
+def emergency_caller_name(details: dict, players: list[dict]) -> str:
+    """Resolve the caller ID from ER:LC's active-call data to a Roblox name."""
+    supplied = find_value(details, "caller", "player", "playerName", "username", default="")
+    if supplied and not supplied.isdigit():
+        return supplied
+
+    call_number = str(details.get("callNumber") or "")
+    server_key = os.getenv("ERLC_SERVER_KEY", "").strip()
+    if not server_key or not call_number:
+        return "Anonymous caller"
+    try:
+        response = requests.get(
+            ERLC_SERVER_URL,
+            headers={"server-key": server_key},
+            params={"EmergencyCalls": "true"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        calls = response.json().get("EmergencyCalls", [])
+    except (requests.RequestException, ValueError, AttributeError):
+        return "Anonymous caller"
+
+    for call in calls:
+        if not isinstance(call, dict) or str(call.get("CallNumber") or "") != call_number:
+            continue
+        caller_id = str(call.get("Caller") or supplied or "")
+        for player in players:
+            if str(player.get("Player") or "").rsplit(":", 1)[-1] == caller_id:
+                return player_display_name(player)
+    return "Anonymous caller"
+
+
 def location_coordinates(location: dict) -> tuple[float, float] | None:
     try:
         return float(location["LocationX"]), float(location["LocationZ"])
@@ -228,11 +266,24 @@ def map_point(world_x: float, world_z: float, bounds: tuple[int, int, int, int])
     )
 
 
-def nearby_police(players: list[dict], call_x: float, call_z: float) -> list[tuple[float, dict]]:
+def dispatch_unit_filter(call_team: str) -> tuple[str, tuple[str, ...]]:
+    """Choose the correct nearby responder group for an ER:LC call."""
+    team = call_team.casefold()
+    if "dot" in team:
+        return "Nearby DOT", ("dot",)
+    if any(word in team for word in ("fire", "medical", "ems", "rescue")):
+        return "Nearby Fire & Rescue", ("fire", "rescue", "medical", "ems")
+    if any(word in team for word in ("police", "sheriff", "state", "law")):
+        return "Nearby Police", ("police", "sheriff", "state")
+    return "Nearby Units", ("police", "sheriff", "state", "fire", "rescue", "medical", "ems", "dot")
+
+
+def nearby_units(players: list[dict], call_x: float, call_z: float, call_team: str) -> list[tuple[float, dict]]:
     units: list[tuple[float, dict]] = []
+    _, responder_keywords = dispatch_unit_filter(call_team)
     for player in players:
         team = str(player.get("Team") or "").casefold()
-        if not any(name in team for name in ("police", "sheriff", "state")):
+        if not any(name in team for name in responder_keywords):
             continue
         coordinates = location_coordinates(player.get("Location") or {})
         if coordinates is None:
@@ -242,8 +293,10 @@ def nearby_police(players: list[dict], call_x: float, call_z: float) -> list[tup
     return sorted(units, key=lambda item: item[0])[:5]
 
 
-def emergency_map(call_x: float, call_z: float, units: list[tuple[float, dict]]) -> io.BytesIO | None:
-    """Create a cropped call map with a red caller pin and blue police pins."""
+def emergency_map(
+    call_x: float, call_z: float, units: list[tuple[float, dict]], caller_name: str
+) -> io.BytesIO | None:
+    """Create a cropped call map with a labelled caller pin and unit pins."""
     if not MAP_FILE.is_file():
         return None
     with Image.open(MAP_FILE) as original:
@@ -273,7 +326,18 @@ def emergency_map(call_x: float, call_z: float, units: list[tuple[float, dict]])
         if coordinates:
             marker(map_point(*coordinates, visible_bounds), "#2878F0", 12)
     marker(call_point, "#E53935", 18)
-    draw.text((24, 24), "Emergency Call", fill="white", stroke_width=3, stroke_fill="black", font=ImageFont.load_default())
+    label = caller_name if caller_name and caller_name != "Anonymous caller" else "Emergency Call"
+    label = label[:32]
+    label_x = max(12, min(680, (call_point[0] - left) * scale_x + 24))
+    label_y = max(12, min(860, (call_point[1] - top) * scale_y - 12))
+    draw.text(
+        (label_x, label_y),
+        label,
+        fill="white",
+        stroke_width=3,
+        stroke_fill="black",
+        font=ImageFont.load_default(),
+    )
 
     output = io.BytesIO()
     cropped.save(output, format="PNG", optimize=True)
@@ -285,20 +349,22 @@ def event_embed(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | N
     event_type = find_value(record, "event", "type", "eventType", "event_type", default="ER:LC Event")
     details = record.get("data") if isinstance(record.get("data"), dict) else record
 
-    if event_type == "EmergencyCallStarted":
+    if is_emergency_call_event(record):
         description = find_value(details, "description", default="No description supplied.")
         location = find_value(details, "positionDescriptor", "location", default="Unknown location")
         team = find_value(details, "team", default="Unknown")
         call_number = find_value(details, "callNumber", default="Unknown")
+        caller = emergency_caller_name(details, players)
+        nearby_heading, _ = dispatch_unit_filter(team)
         try:
             call_x, call_z = (float(value) for value in details.get("position", [])[:2])
         except (TypeError, ValueError):
             call_x = call_z = 0.0
-        units = nearby_police(players, call_x, call_z) if call_x or call_z else []
+        units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
         nearby_text = "\n".join(
             f"• **{player_display_name(unit)}** — {unit.get('Callsign') or 'No callsign'} ({distance:.0f}m)"
             for distance, unit in units
-        ) or "No nearby police units found."
+        ) or f"No {nearby_heading.casefold()} found."
         embed = {
             "title": "ER:LC Emergency Call",
             "color": 0xE67E22,
@@ -307,12 +373,12 @@ def event_embed(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | N
                 {"name": "Department", "value": team[:1024], "inline": True},
                 {"name": "Location", "value": location[:1024], "inline": False},
                 {"name": "Details", "value": description[:1024], "inline": False},
-                {"name": "Nearby Police", "value": nearby_text[:1024], "inline": False},
+                {"name": nearby_heading, "value": nearby_text[:1024], "inline": False},
             ],
             "footer": {"text": "ER:LC Event Webhook"},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        map_image = emergency_map(call_x, call_z, units) if call_x or call_z else None
+        map_image = emergency_map(call_x, call_z, units, caller) if call_x or call_z else None
         if map_image:
             embed["image"] = {"url": "attachment://erlc_emergency_map.png"}
         return embed, map_image
@@ -354,25 +420,28 @@ def event_embed(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | N
 def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | None]:
     """Build a Components V2 dispatch card for a phone emergency call."""
     details = record.get("data") if isinstance(record.get("data"), dict) else {}
+    event_name = find_value(record, "event", "type", "eventType", "event_type", default="")
     description = find_value(details, "description", default="No details provided.")
     location = find_value(details, "positionDescriptor", "location", default="Unknown location")
     team = find_value(details, "team", default="Emergency Services")
     call_number = find_value(details, "callNumber", default="Unknown")
-    caller = find_value(details, "caller", "player", "playerName", "username", default="Anonymous caller")
+    caller = emergency_caller_name(details, players)
+    nearby_heading, _ = dispatch_unit_filter(team)
     try:
         call_x, call_z = (float(value) for value in details.get("position", [])[:2])
     except (TypeError, ValueError):
         call_x = call_z = 0.0
-    units = nearby_police(players, call_x, call_z) if call_x or call_z else []
+    units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
     unit_text = "\n".join(
         f"**{player_display_name(unit)}** — {unit.get('Callsign') or 'No callsign'} • {distance:.0f}m away"
         for distance, unit in units
-    ) or "*No nearby police units found.*"
+    ) or f"*No {nearby_heading.casefold()} found.*"
     timestamp = int(record.get("timestamp") or datetime.now(timezone.utc).timestamp())
-    map_image = emergency_map(call_x, call_z, units) if call_x or call_z else None
+    map_image = emergency_map(call_x, call_z, units, caller) if call_x or call_z else None
 
+    call_heading = "911 Call Closed" if event_name == "EmergencyCallEnded" else "911 Call Received"
     card_components = [
-        {"type": 10, "content": f"## 911 Call Received: {team}"},
+        {"type": 10, "content": f"## {call_heading}: {team}"},
         {
             "type": 10,
             "content": (
@@ -403,21 +472,18 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
     }, map_image
 
 
-def discord_payload(data: dict) -> tuple[dict, io.BytesIO | None]:
+def discord_payload(data: dict) -> tuple[dict | None, io.BytesIO | None]:
+    """Create a dispatch post only for a real player's newly opened 911 call."""
     players = server_players()
     records = event_records(data)[:10]
-    if len(records) == 1 and find_value(records[0], "event", default="") == "EmergencyCallStarted":
-        return emergency_component_payload(records[0], players)
-    map_image: io.BytesIO | None = None
-    embeds = []
     for record in records:
-        embed, rendered_map = event_embed(record, players)
-        embeds.append(embed)
-        map_image = map_image or rendered_map
-    return {
-        "username": "Brisbane Roleplay - ER:LC",
-        "embeds": embeds,
-    }, map_image
+        event_name = find_value(record, "event", "type", "eventType", "event_type", default="")
+        if event_name != "EmergencyCallStarted":
+            continue
+        details = record.get("data") if isinstance(record.get("data"), dict) else {}
+        if emergency_caller_name(details, players) != "Anonymous caller":
+            return emergency_component_payload(record, players)
+    return None, None
 
 
 def post_to_discord(
@@ -501,6 +567,10 @@ def erlc_events():
 
     try:
         payload, map_image = discord_payload(event)
+        if payload is None:
+            # A webhook was valid but it was an automated ER:LC event, a closed
+            # call, or a probe.  Accept it without posting anything to Discord.
+            return Response(status=204)
         result = post_to_discord(webhook_url, bot_token, channel_id, payload, map_image)
         if not result.ok:
             app.logger.error(
