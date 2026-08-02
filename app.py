@@ -226,36 +226,42 @@ def emergency_caller_name(details: dict, players: list[dict]) -> str:
     server_key = os.getenv("ERLC_SERVER_KEY", "").strip()
     if not server_key or not call_number:
         return "Anonymous caller"
-    try:
-        response = requests.get(
-            ERLC_SERVER_URL,
-            headers={"server-key": server_key},
-            params={"EmergencyCalls": "true"},
-            timeout=8,
-        )
-        response.raise_for_status()
-        calls = response.json().get("EmergencyCalls", [])
-    except (requests.RequestException, ValueError, AttributeError):
-        return "Anonymous caller"
+    # The webhook can arrive a fraction of a second before ER:LC exposes the
+    # same call through its server API. Retry briefly before treating it as an
+    # automated call.
+    for attempt in range(4):
+        try:
+            response = requests.get(
+                ERLC_SERVER_URL,
+                headers={"server-key": server_key},
+                params={"EmergencyCalls": "true"},
+                timeout=8,
+            )
+            response.raise_for_status()
+            calls = response.json().get("EmergencyCalls", [])
+        except (requests.RequestException, ValueError, AttributeError):
+            calls = []
 
-    for call in calls:
-        if not isinstance(call, dict) or str(call.get("CallNumber") or "") != call_number:
-            continue
-        caller_id = str(call.get("Caller") or supplied or "")
-        for player in players:
-            if str(player.get("Player") or "").rsplit(":", 1)[-1] == caller_id:
-                return player_display_name(player)
-        if caller_id.isdigit():
-            try:
-                roblox_response = requests.get(
-                    f"https://users.roblox.com/v1/users/{caller_id}", timeout=8
-                )
-                roblox_response.raise_for_status()
-                username = roblox_response.json().get("name")
-                if username:
-                    return str(username)
-            except (requests.RequestException, ValueError, AttributeError):
-                pass
+        for call in calls:
+            if not isinstance(call, dict) or str(call.get("CallNumber") or "") != call_number:
+                continue
+            caller_id = str(call.get("Caller") or supplied or "")
+            for player in players:
+                if str(player.get("Player") or "").rsplit(":", 1)[-1] == caller_id:
+                    return player_display_name(player)
+            if caller_id.isdigit():
+                try:
+                    roblox_response = requests.get(
+                        f"https://users.roblox.com/v1/users/{caller_id}", timeout=8
+                    )
+                    roblox_response.raise_for_status()
+                    username = roblox_response.json().get("name")
+                    if username:
+                        return str(username)
+                except (requests.RequestException, ValueError, AttributeError):
+                    pass
+        if attempt < 3:
+            time.sleep(0.5)
     return "Anonymous caller"
 
 
