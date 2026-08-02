@@ -411,16 +411,47 @@ def emergency_map(
         (output_width, output_height), Image.Resampling.LANCZOS
     )
     draw = ImageDraw.Draw(cropped)
+    try:
+        label_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 16)
+    except OSError:
+        label_font = ImageFont.load_default()
     scale_x = output_width / crop_width
     scale_y = output_height / crop_height
 
     def screen_point(point: tuple[int, int]) -> tuple[float, float]:
         return (point[0] - left) * scale_x, (point[1] - top) * scale_y
 
-    def marker(point: tuple[int, int], colour: str, radius: int) -> tuple[float, float]:
+    def marker(point: tuple[int, int], colour: str) -> tuple[float, float]:
+        """Draw a pointed map pin; the tip marks the exact ER:LC location."""
         x, y = screen_point(point)
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=colour, outline="white", width=4)
+        centre_y = y - 22
+        draw.polygon(
+            [(x - 20, centre_y), (x + 20, centre_y), (x, y + 13)],
+            fill=colour,
+            outline="white",
+            width=3,
+        )
+        draw.ellipse((x - 22, centre_y - 22, x + 22, centre_y + 22), fill=colour, outline="white", width=3)
+        draw.ellipse((x - 9, centre_y - 9, x + 9, centre_y + 9), fill="white")
+        draw.ellipse((x - 3, centre_y - 3, x + 3, centre_y + 3), fill=colour)
         return x, y
+
+    def username_tag(point: tuple[float, float], username: str) -> None:
+        """Draw a compact black rounded username label beside a map pin."""
+        name = username[:24]
+        box = draw.textbbox((0, 0), name, font=label_font)
+        text_width, text_height = box[2] - box[0], box[3] - box[1]
+        tag_width, tag_height = text_width + 16, text_height + 12
+        tag_x = max(6, min(output_width - tag_width - 6, point[0] + 24))
+        tag_y = max(6, min(output_height - tag_height - 6, point[1] - 54))
+        draw.rounded_rectangle(
+            (tag_x, tag_y, tag_x + tag_width, tag_y + tag_height),
+            radius=7,
+            fill="#080808",
+            outline="#292929",
+            width=1,
+        )
+        draw.text((tag_x + 8, tag_y + 6), name, fill="white", font=label_font)
 
     call_screen = screen_point(call_point)
     for _, unit in units:
@@ -430,31 +461,11 @@ def emergency_map(
             unit_screen = screen_point(unit_point)
             # The line makes it clear which nearby responder belongs to this call.
             draw.line((unit_screen[0], unit_screen[1], call_screen[0], call_screen[1]), fill="#2878F0", width=4)
-            marker(unit_point, "#2878F0", 12)
-            unit_label = player_display_name(unit)[:24]
-            unit_label_x = max(12, min(output_width - 180, unit_screen[0] + 18))
-            unit_label_y = max(12, min(output_height - 20, unit_screen[1] - 14))
-            draw.text(
-                (unit_label_x, unit_label_y),
-                unit_label,
-                fill="white",
-                stroke_width=3,
-                stroke_fill="black",
-                font=ImageFont.load_default(),
-            )
-    marker(call_point, "#E53935", 18)
+            marker(unit_point, "#2878F0")
+            username_tag(unit_screen, player_display_name(unit))
+    marker(call_point, "#E53935")
     label = caller_name if caller_name and caller_name != "Anonymous caller" else "Emergency Call"
-    label = label[:32]
-    label_x = max(12, min(output_width - 180, (call_point[0] - left) * scale_x + 24))
-    label_y = max(12, min(output_height - 20, (call_point[1] - top) * scale_y - 12))
-    draw.text(
-        (label_x, label_y),
-        label,
-        fill="white",
-        stroke_width=3,
-        stroke_fill="black",
-        font=ImageFont.load_default(),
-    )
+    username_tag(call_screen, label)
 
     output = io.BytesIO()
     # JPEG is much smaller than a PNG photo-style map, so dispatch posts arrive
