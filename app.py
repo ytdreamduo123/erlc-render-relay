@@ -18,7 +18,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from PIL import Image, ImageDraw, ImageFont
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 
 app = Flask(__name__)
@@ -30,6 +30,8 @@ ERLC_PUBLIC_KEY = (
 PUBLIC_KEY = serialization.load_der_public_key(base64.b64decode(ERLC_PUBLIC_KEY))
 ERLC_SERVER_URL = "https://api.erlc.gg/v2/server"
 MAP_FILE = Path(__file__).with_name("erlc_map.png")
+LOGO_FILE = Path(__file__).with_name("brisbane_logo.png")
+RELAY_PUBLIC_URL = os.getenv("RELAY_PUBLIC_URL", "https://erlc-render-relay.onrender.com").rstrip("/")
 # These convert ER:LC's live LocationX/LocationZ coordinates into the current
 # 1024px ER:LC map tile grid.  The values are anchored to the live Police
 # Station and Civilian Spawn positions, rather than the old unrelated image.
@@ -42,9 +44,9 @@ MAP_Y_OFFSET = float(os.getenv("ERLC_MAP_Y_OFFSET", "-141.0"))
 # player phone calls.  This avoids a small interpolation error at those sites.
 LOCATION_MAP_ANCHORS = {
     "civilian spawn": (291, 822),
-    "police": (499, 640),
-    "police station": (499, 640),
-    "pd": (499, 640),
+    "police": (499, 610),
+    "police station": (499, 610),
+    "pd": (499, 610),
 }
 
 
@@ -594,7 +596,8 @@ def emergency_component_payload(
     card_components.append({"type": 10, "content": "-# Brisbane City Communication - 000 Emergency Dispatch"})
 
     return {
-        "username": "Brisbane Roleplay - ER:LC",
+        "username": "Brisbane City Communications",
+        "avatar_url": f"{RELAY_PUBLIC_URL}/brisbane-logo.png",
         "flags": 32768,
         "components": [{"type": 17, "components": card_components}],
     }, map_image
@@ -654,6 +657,12 @@ def post_to_discord(
 @app.get("/")
 def health_check():
     return jsonify(status="online", service="erlc-event-relay")
+
+
+@app.get("/brisbane-logo.png")
+def brisbane_logo():
+    """Public logo used as the Discord webhook avatar."""
+    return send_file(LOGO_FILE, mimetype="image/png", max_age=86400)
 
 
 @app.post("/erlc/events")
