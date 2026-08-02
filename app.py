@@ -491,6 +491,13 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
         for distance, unit in units
     ) or f"*No {nearby_heading.casefold()} found.*"
     timestamp = int(record.get("timestamp") or datetime.now(timezone.utc).timestamp())
+    app.logger.warning(
+        "Map calibration: %s at ER:LC coordinates X=%s, Z=%s (%s).",
+        caller,
+        call_x,
+        call_z,
+        location,
+    )
     map_image = emergency_map(call_x, call_z, units, caller) if call_x or call_z else None
 
     call_heading = "911 Call Closed" if event_name == "EmergencyCallEnded" else "911 Call Received"
