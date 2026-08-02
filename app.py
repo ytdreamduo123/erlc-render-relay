@@ -30,13 +30,14 @@ ERLC_PUBLIC_KEY = (
 PUBLIC_KEY = serialization.load_der_public_key(base64.b64decode(ERLC_PUBLIC_KEY))
 ERLC_SERVER_URL = "https://api.erlc.gg/v2/server"
 MAP_FILE = Path(__file__).with_name("erlc_map.png")
-# ER:LC's API uses a world origin in the middle of the map, so locations can
-# have negative values.  The old 0..4096 range clamped those calls to a corner.
-# These values can be adjusted in Render if the game map changes.
-WORLD_X_MIN = float(os.getenv("ERLC_MAP_X_MIN", "-3000"))
-WORLD_X_MAX = float(os.getenv("ERLC_MAP_X_MAX", "3000"))
-WORLD_Z_MIN = float(os.getenv("ERLC_MAP_Z_MIN", "-3000"))
-WORLD_Z_MAX = float(os.getenv("ERLC_MAP_Z_MAX", "3000"))
+# Calibrated from ER:LC's current Civilian Spawn and Sheriff's Office map data.
+# These turn the API's LocationX/LocationZ values into pixels on the supplied
+# 1600x1600 ER:LC map image. They can be overridden in Render after a future
+# ER:LC map expansion without changing code.
+MAP_X_SCALE = float(os.getenv("ERLC_MAP_X_SCALE", "0.3450"))
+MAP_X_OFFSET = float(os.getenv("ERLC_MAP_X_OFFSET", "-128.9"))
+MAP_Y_SCALE = float(os.getenv("ERLC_MAP_Y_SCALE", "0.2485"))
+MAP_Y_OFFSET = float(os.getenv("ERLC_MAP_Y_OFFSET", "54.6"))
 
 
 def map_bounds(image: Image.Image) -> tuple[int, int, int, int]:
@@ -275,11 +276,11 @@ def location_coordinates(location: dict) -> tuple[float, float] | None:
 def map_point(world_x: float, world_z: float, bounds: tuple[int, int, int, int]) -> tuple[int, int]:
     """Convert ER:LC world coordinates into pixels on the supplied map."""
     left, top, right, bottom = bounds
-    x_ratio = (world_x - WORLD_X_MIN) / (WORLD_X_MAX - WORLD_X_MIN)
-    z_ratio = (world_z - WORLD_Z_MIN) / (WORLD_Z_MAX - WORLD_Z_MIN)
+    pixel_x = MAP_X_SCALE * world_x + MAP_X_OFFSET
+    pixel_y = MAP_Y_SCALE * world_z + MAP_Y_OFFSET
     return (
-        round(left + max(0.0, min(1.0, x_ratio)) * (right - left)),
-        round(bottom - max(0.0, min(1.0, z_ratio)) * (bottom - top)),
+        round(max(left, min(right, pixel_x))),
+        round(max(top, min(bottom, pixel_y))),
     )
 
 
@@ -310,6 +311,48 @@ def nearby_units(players: list[dict], call_x: float, call_z: float, call_team: s
     return sorted(units, key=lambda item: item[0])[:5]
 
 
+def map_window(image: Image.Image, call_point: tuple[int, int], bounds: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Choose a call-containing crop with the least white area from the map edge."""
+    map_left, map_top, map_right, map_bottom = bounds
+    crop_width = min(620, map_right - map_left)
+    crop_height = min(620, map_bottom - map_top)
+    candidates: list[tuple[int, int]] = []
+    for x_anchor in (0.2, 0.5, 0.8):
+        for y_anchor in (0.2, 0.5, 0.8):
+            left = round(call_point[0] - crop_width * x_anchor)
+            top = round(call_point[1] - crop_height * y_anchor)
+            left = max(map_left, min(map_right - crop_width, left))
+            top = max(map_top, min(map_bottom - crop_height, top))
+            candidates.append((left, top))
+
+    def white_score(left: int, top: int) -> int:
+        preview = image.crop((left, top, left + crop_width, top + crop_height)).resize((50, 50))
+        return sum(1 for red, green, blue in preview.getdata() if red > 245 and green > 245 and blue > 245)
+
+    left, top = min(candidates, key=lambda candidate: white_score(*candidate))
+    return left, top, crop_width, crop_height
+
+
+def visible_map_units(call_x: float, call_z: float, units: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
+    """Keep the responder list identical to the unit pins visible on the map."""
+    if not MAP_FILE.is_file():
+        return units
+    with Image.open(MAP_FILE) as original:
+        image = original.convert("RGB")
+    bounds = map_bounds(image)
+    call_point = map_point(call_x, call_z, bounds)
+    left, top, width, height = map_window(image, call_point, bounds)
+    visible: list[tuple[float, dict]] = []
+    for distance, unit in units:
+        coordinates = location_coordinates(unit.get("Location") or {})
+        if coordinates is None:
+            continue
+        point = map_point(*coordinates, bounds)
+        if left <= point[0] <= left + width and top <= point[1] <= top + height:
+            visible.append((distance, unit))
+    return visible
+
+
 def emergency_map(
     call_x: float, call_z: float, units: list[tuple[float, dict]], caller_name: str
 ) -> io.BytesIO | None:
@@ -320,15 +363,7 @@ def emergency_map(
         image = original.convert("RGB")
     visible_bounds = map_bounds(image)
     call_point = map_point(call_x, call_z, visible_bounds)
-    crop_size = 620
-    half = crop_size // 2
-    # Keep the crop inside the actual ER:LC map, not its white border.  A map
-    # can be smaller than the preferred crop, so never calculate a negative edge.
-    map_left, map_top, map_right, map_bottom = visible_bounds
-    crop_width = min(crop_size, map_right - map_left)
-    crop_height = min(crop_size, map_bottom - map_top)
-    left = max(map_left, min(map_right - crop_width, call_point[0] - crop_width // 2))
-    top = max(map_top, min(map_bottom - crop_height, call_point[1] - crop_height // 2))
+    left, top, crop_width, crop_height = map_window(image, call_point, visible_bounds)
     cropped = image.crop((left, top, left + crop_width, top + crop_height)).resize((900, 900), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(cropped)
     scale_x = 900 / crop_width
@@ -378,6 +413,7 @@ def event_embed(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | N
         except (TypeError, ValueError):
             call_x = call_z = 0.0
         units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
+        units = visible_map_units(call_x, call_z, units) if call_x or call_z else units
         nearby_text = "\n".join(
             f"• **{player_display_name(unit)}** — {unit.get('Callsign') or 'No callsign'} ({distance:.0f}m)"
             for distance, unit in units
@@ -449,6 +485,7 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
     except (TypeError, ValueError):
         call_x = call_z = 0.0
     units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
+    units = visible_map_units(call_x, call_z, units) if call_x or call_z else units
     unit_text = "\n".join(
         f"**{player_display_name(unit)}** — {unit.get('Callsign') or 'No callsign'} • {distance:.0f}m away"
         for distance, unit in units
