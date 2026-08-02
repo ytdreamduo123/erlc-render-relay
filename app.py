@@ -404,25 +404,41 @@ def post_to_discord(
 ) -> requests.Response:
     """Post as the bot when configured, with webhook fallback and 5xx retries."""
     as_bot = bool(bot_token and channel_id)
-    endpoint = (
-        f"https://discord.com/api/v10/channels/{channel_id}/messages"
-        if as_bot
-        else webhook_url
-    )
-    headers = {"Authorization": f"Bot {bot_token}"} if as_bot else None
-    last_response: requests.Response | None = None
-    for attempt in range(3):
+
+    def send(endpoint: str, headers: dict[str, str] | None) -> requests.Response:
         if map_image:
             map_image.seek(0)
-            response = requests.post(
+            return requests.post(
                 endpoint,
                 headers=headers,
                 data={"payload_json": json.dumps(payload)},
                 files={"files[0]": ("erlc_emergency_map.png", map_image, "image/png")},
                 timeout=15,
             )
-        else:
-            response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+        return requests.post(endpoint, headers=headers, json=payload, timeout=10)
+
+    endpoint = f"https://discord.com/api/v10/channels/{channel_id}/messages" if as_bot else webhook_url
+    headers = {"Authorization": f"Bot {bot_token}"} if as_bot else None
+    last_response: requests.Response | None = None
+    for attempt in range(3):
+        response = send(endpoint, headers)
+        if as_bot and not response.ok and webhook_url:
+            try:
+                identity = requests.get(
+                    "https://discord.com/api/v10/users/@me",
+                    headers=headers,
+                    timeout=8,
+                ).json()
+                app.logger.error(
+                    "Bot delivery failed (HTTP %s) for bot %s (%s), channel %s. Falling back to webhook.",
+                    response.status_code,
+                    identity.get("username", "unknown"),
+                    identity.get("id", "unknown"),
+                    channel_id,
+                )
+            except requests.RequestException:
+                app.logger.error("Bot delivery failed (HTTP %s); falling back to webhook.", response.status_code)
+            response = send(webhook_url, None)
         last_response = response
         if response.ok or response.status_code < 500:
             return response
