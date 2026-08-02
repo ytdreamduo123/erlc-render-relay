@@ -30,14 +30,22 @@ ERLC_PUBLIC_KEY = (
 PUBLIC_KEY = serialization.load_der_public_key(base64.b64decode(ERLC_PUBLIC_KEY))
 ERLC_SERVER_URL = "https://api.erlc.gg/v2/server"
 MAP_FILE = Path(__file__).with_name("erlc_map.png")
-# Calibrated from ER:LC's current Civilian Spawn and Sheriff's Office map data.
-# These turn the API's LocationX/LocationZ values into pixels on the supplied
-# 1600x1600 ER:LC map image. They can be overridden in Render after a future
-# ER:LC map expansion without changing code.
-MAP_X_SCALE = float(os.getenv("ERLC_MAP_X_SCALE", "0.2890"))
-MAP_X_OFFSET = float(os.getenv("ERLC_MAP_X_OFFSET", "-76.4"))
-MAP_Y_SCALE = float(os.getenv("ERLC_MAP_Y_SCALE", "0.4549"))
-MAP_Y_OFFSET = float(os.getenv("ERLC_MAP_Y_OFFSET", "-442.2"))
+# These convert ER:LC's live LocationX/LocationZ coordinates into the current
+# 1024px ER:LC map tile grid.  The values are anchored to the live Police
+# Station and Civilian Spawn positions, rather than the old unrelated image.
+MAP_X_SCALE = float(os.getenv("ERLC_MAP_X_SCALE", "0.3516"))
+MAP_X_OFFSET = float(os.getenv("ERLC_MAP_X_OFFSET", "-37.7"))
+MAP_Y_SCALE = float(os.getenv("ERLC_MAP_Y_SCALE", "0.3999"))
+MAP_Y_OFFSET = float(os.getenv("ERLC_MAP_Y_OFFSET", "-141.0"))
+
+# Exact map anchors for the two location labels ER:LC sends for the most common
+# player phone calls.  This avoids a small interpolation error at those sites.
+LOCATION_MAP_ANCHORS = {
+    "civilian spawn": (291, 822),
+    "police": (479, 687),
+    "police station": (479, 687),
+    "pd": (479, 687),
+}
 
 
 def map_bounds(image: Image.Image) -> tuple[int, int, int, int]:
@@ -273,11 +281,21 @@ def location_coordinates(location: dict) -> tuple[float, float] | None:
         return None
 
 
-def map_point(world_x: float, world_z: float, bounds: tuple[int, int, int, int]) -> tuple[int, int]:
-    """Convert ER:LC world coordinates into pixels on the supplied map."""
+def map_point(
+    world_x: float,
+    world_z: float,
+    bounds: tuple[int, int, int, int],
+    location_name: str = "",
+) -> tuple[int, int]:
+    """Convert ER:LC world coordinates into pixels on the current ER:LC map."""
     left, top, right, bottom = bounds
-    pixel_x = MAP_X_SCALE * world_x + MAP_X_OFFSET
-    pixel_y = MAP_Y_SCALE * world_z + MAP_Y_OFFSET
+    normalized_location = str(location_name).strip().casefold()
+    anchor = LOCATION_MAP_ANCHORS.get(normalized_location)
+    if anchor is None:
+        pixel_x = MAP_X_SCALE * world_x + MAP_X_OFFSET
+        pixel_y = MAP_Y_SCALE * world_z + MAP_Y_OFFSET
+    else:
+        pixel_x, pixel_y = anchor
     return (
         round(max(left, min(right, pixel_x))),
         round(max(top, min(bottom, pixel_y))),
@@ -333,14 +351,19 @@ def map_window(image: Image.Image, call_point: tuple[int, int], bounds: tuple[in
     return left, top, crop_width, crop_height
 
 
-def visible_map_units(call_x: float, call_z: float, units: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
+def visible_map_units(
+    call_x: float,
+    call_z: float,
+    units: list[tuple[float, dict]],
+    location_name: str = "",
+) -> list[tuple[float, dict]]:
     """Keep the responder list identical to the unit pins visible on the map."""
     if not MAP_FILE.is_file():
         return units
     with Image.open(MAP_FILE) as original:
         image = original.convert("RGB")
     bounds = map_bounds(image)
-    call_point = map_point(call_x, call_z, bounds)
+    call_point = map_point(call_x, call_z, bounds, location_name)
     left, top, width, height = map_window(image, call_point, bounds)
     visible: list[tuple[float, dict]] = []
     for distance, unit in units:
@@ -354,7 +377,11 @@ def visible_map_units(call_x: float, call_z: float, units: list[tuple[float, dic
 
 
 def emergency_map(
-    call_x: float, call_z: float, units: list[tuple[float, dict]], caller_name: str
+    call_x: float,
+    call_z: float,
+    units: list[tuple[float, dict]],
+    caller_name: str,
+    location_name: str = "",
 ) -> io.BytesIO | None:
     """Create a cropped call map with a labelled caller pin and unit pins."""
     if not MAP_FILE.is_file():
@@ -362,7 +389,7 @@ def emergency_map(
     with Image.open(MAP_FILE) as original:
         image = original.convert("RGB")
     visible_bounds = map_bounds(image)
-    call_point = map_point(call_x, call_z, visible_bounds)
+    call_point = map_point(call_x, call_z, visible_bounds, location_name)
     left, top, crop_width, crop_height = map_window(image, call_point, visible_bounds)
     cropped = image.crop((left, top, left + crop_width, top + crop_height)).resize((900, 900), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(cropped)
@@ -413,7 +440,7 @@ def event_embed(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | N
         except (TypeError, ValueError):
             call_x = call_z = 0.0
         units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
-        units = visible_map_units(call_x, call_z, units) if call_x or call_z else units
+        units = visible_map_units(call_x, call_z, units, location) if call_x or call_z else units
         nearby_text = "\n".join(
             f"• **{player_display_name(unit)}** — {unit.get('Callsign') or 'No callsign'} ({distance:.0f}m)"
             for distance, unit in units
@@ -431,7 +458,7 @@ def event_embed(record: dict, players: list[dict]) -> tuple[dict, io.BytesIO | N
             "footer": {"text": "ER:LC Event Webhook"},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        map_image = emergency_map(call_x, call_z, units, caller) if call_x or call_z else None
+        map_image = emergency_map(call_x, call_z, units, caller, location) if call_x or call_z else None
         if map_image:
             embed["image"] = {"url": "attachment://erlc_emergency_map.png"}
         return embed, map_image
@@ -485,7 +512,7 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
     except (TypeError, ValueError):
         call_x = call_z = 0.0
     units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
-    units = visible_map_units(call_x, call_z, units) if call_x or call_z else units
+    units = visible_map_units(call_x, call_z, units, location) if call_x or call_z else units
     unit_text = "\n".join(
         f"**{player_display_name(unit)}** — {unit.get('Callsign') or 'No callsign'} • {distance:.0f}m away"
         for distance, unit in units
@@ -498,7 +525,7 @@ def emergency_component_payload(record: dict, players: list[dict]) -> tuple[dict
         call_z,
         location,
     )
-    map_image = emergency_map(call_x, call_z, units, caller) if call_x or call_z else None
+    map_image = emergency_map(call_x, call_z, units, caller, location) if call_x or call_z else None
 
     call_heading = "911 Call Closed" if event_name == "EmergencyCallEnded" else "911 Call Received"
     card_components = [
