@@ -42,9 +42,9 @@ MAP_Y_OFFSET = float(os.getenv("ERLC_MAP_Y_OFFSET", "-141.0"))
 # player phone calls.  This avoids a small interpolation error at those sites.
 LOCATION_MAP_ANCHORS = {
     "civilian spawn": (291, 822),
-    "police": (479, 687),
-    "police station": (479, 687),
-    "pd": (479, 687),
+    "police": (492, 666),
+    "police station": (492, 666),
+    "pd": (492, 666),
 }
 
 
@@ -332,8 +332,9 @@ def nearby_units(players: list[dict], call_x: float, call_z: float, call_team: s
 def map_window(image: Image.Image, call_point: tuple[int, int], bounds: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     """Choose a call-containing crop with the least white area from the map edge."""
     map_left, map_top, map_right, map_bottom = bounds
-    crop_width = min(620, map_right - map_left)
-    crop_height = min(620, map_bottom - map_top)
+    # A tighter crop keeps the caller and on-screen responders easy to read.
+    crop_width = min(460, map_right - map_left)
+    crop_height = min(460, map_bottom - map_top)
     candidates: list[tuple[int, int]] = []
     for x_anchor in (0.2, 0.5, 0.8):
         for y_anchor in (0.2, 0.5, 0.8):
@@ -396,14 +397,34 @@ def emergency_map(
     scale_x = 900 / crop_width
     scale_y = 900 / crop_height
 
-    def marker(point: tuple[int, int], colour: str, radius: int) -> None:
-        x, y = (point[0] - left) * scale_x, (point[1] - top) * scale_y
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=colour, outline="white", width=4)
+    def screen_point(point: tuple[int, int]) -> tuple[float, float]:
+        return (point[0] - left) * scale_x, (point[1] - top) * scale_y
 
+    def marker(point: tuple[int, int], colour: str, radius: int) -> tuple[float, float]:
+        x, y = screen_point(point)
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=colour, outline="white", width=4)
+        return x, y
+
+    call_screen = screen_point(call_point)
     for _, unit in units:
         coordinates = location_coordinates(unit.get("Location") or {})
         if coordinates:
-            marker(map_point(*coordinates, visible_bounds), "#2878F0", 12)
+            unit_point = map_point(*coordinates, visible_bounds)
+            unit_screen = screen_point(unit_point)
+            # The line makes it clear which nearby responder belongs to this call.
+            draw.line((unit_screen[0], unit_screen[1], call_screen[0], call_screen[1]), fill="#2878F0", width=4)
+            marker(unit_point, "#2878F0", 12)
+            unit_label = player_display_name(unit)[:24]
+            unit_label_x = max(12, min(700, unit_screen[0] + 18))
+            unit_label_y = max(12, min(875, unit_screen[1] - 14))
+            draw.text(
+                (unit_label_x, unit_label_y),
+                unit_label,
+                fill="white",
+                stroke_width=3,
+                stroke_fill="black",
+                font=ImageFont.load_default(),
+            )
     marker(call_point, "#E53935", 18)
     label = caller_name if caller_name and caller_name != "Anonymous caller" else "Emergency Call"
     label = label[:32]
