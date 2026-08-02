@@ -245,6 +245,17 @@ def emergency_caller_name(details: dict, players: list[dict]) -> str:
         for player in players:
             if str(player.get("Player") or "").rsplit(":", 1)[-1] == caller_id:
                 return player_display_name(player)
+        if caller_id.isdigit():
+            try:
+                roblox_response = requests.get(
+                    f"https://users.roblox.com/v1/users/{caller_id}", timeout=8
+                )
+                roblox_response.raise_for_status()
+                username = roblox_response.json().get("name")
+                if username:
+                    return str(username)
+            except (requests.RequestException, ValueError, AttributeError):
+                pass
     return "Anonymous caller"
 
 
@@ -481,8 +492,13 @@ def discord_payload(data: dict) -> tuple[dict | None, io.BytesIO | None]:
         if event_name != "EmergencyCallStarted":
             continue
         details = record.get("data") if isinstance(record.get("data"), dict) else {}
-        if emergency_caller_name(details, players) != "Anonymous caller":
+        caller = emergency_caller_name(details, players)
+        if caller != "Anonymous caller":
             return emergency_component_payload(record, players)
+        app.logger.info(
+            "Ignored EmergencyCallStarted #%s because ER:LC did not provide a real caller ID.",
+            details.get("callNumber", "unknown"),
+        )
     return None, None
 
 
