@@ -514,17 +514,19 @@ def post_to_discord(
     map_image: io.BytesIO | None,
 ) -> requests.Response:
     """Post Components V2 directly through the configured Discord webhook."""
+    separator = "&" if "?" in webhook_url else "?"
+    webhook_endpoint = f"{webhook_url}{separator}wait=true&with_components=true"
 
     def send() -> requests.Response:
         if map_image:
             map_image.seek(0)
             return requests.post(
-                webhook_url,
+                webhook_endpoint,
                 data={"payload_json": json.dumps(payload)},
                 files={"files[0]": ("erlc_emergency_map.png", map_image, "image/png")},
                 timeout=15,
             )
-        return requests.post(webhook_url, json=payload, timeout=10)
+        return requests.post(webhook_endpoint, json=payload, timeout=10)
 
     last_response: requests.Response | None = None
     for attempt in range(3):
