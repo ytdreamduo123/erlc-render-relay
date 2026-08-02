@@ -30,13 +30,34 @@ ERLC_PUBLIC_KEY = (
 PUBLIC_KEY = serialization.load_der_public_key(base64.b64decode(ERLC_PUBLIC_KEY))
 ERLC_SERVER_URL = "https://api.erlc.gg/v2/server"
 MAP_FILE = Path(__file__).with_name("erlc_map.png")
-# The map's visible land area inside the supplied 1600px image.
-MAP_BOUNDS = (48, 110, 1555, 1498)
-# These can be refined in Render without changing code if ER:LC adjusts its map.
-WORLD_X_MIN = float(os.getenv("ERLC_MAP_X_MIN", "0"))
-WORLD_X_MAX = float(os.getenv("ERLC_MAP_X_MAX", "4096"))
-WORLD_Z_MIN = float(os.getenv("ERLC_MAP_Z_MIN", "0"))
-WORLD_Z_MAX = float(os.getenv("ERLC_MAP_Z_MAX", "4096"))
+# ER:LC's API uses a world origin in the middle of the map, so locations can
+# have negative values.  The old 0..4096 range clamped those calls to a corner.
+# These values can be adjusted in Render if the game map changes.
+WORLD_X_MIN = float(os.getenv("ERLC_MAP_X_MIN", "-3000"))
+WORLD_X_MAX = float(os.getenv("ERLC_MAP_X_MAX", "3000"))
+WORLD_Z_MIN = float(os.getenv("ERLC_MAP_Z_MIN", "-3000"))
+WORLD_Z_MAX = float(os.getenv("ERLC_MAP_Z_MAX", "3000"))
+
+
+def map_bounds(image: Image.Image) -> tuple[int, int, int, int]:
+    """Find the real map area and exclude the white border in source images."""
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    pixels = rgb.load()
+    left, top, right, bottom = width, height, -1, -1
+
+    # The supplied ER:LC map has a white background.  Sample every fourth pixel
+    # to quickly locate the non-white island without making webhook delivery slow.
+    for y in range(0, height, 4):
+        for x in range(0, width, 4):
+            red, green, blue = pixels[x, y]
+            if min(red, green, blue) < 235:
+                left, top = min(left, x), min(top, y)
+                right, bottom = max(right, x), max(bottom, y)
+
+    if right <= left or bottom <= top:
+        return (0, 0, width, height)
+    return (max(0, left - 8), max(0, top - 8), min(width, right + 8), min(height, bottom + 8))
 
 
 def verified_request() -> tuple[bool, bytes]:
@@ -196,9 +217,9 @@ def location_coordinates(location: dict) -> tuple[float, float] | None:
         return None
 
 
-def map_point(world_x: float, world_z: float) -> tuple[int, int]:
+def map_point(world_x: float, world_z: float, bounds: tuple[int, int, int, int]) -> tuple[int, int]:
     """Convert ER:LC world coordinates into pixels on the supplied map."""
-    left, top, right, bottom = MAP_BOUNDS
+    left, top, right, bottom = bounds
     x_ratio = (world_x - WORLD_X_MIN) / (WORLD_X_MAX - WORLD_X_MIN)
     z_ratio = (world_z - WORLD_Z_MIN) / (WORLD_Z_MAX - WORLD_Z_MIN)
     return (
@@ -227,26 +248,30 @@ def emergency_map(call_x: float, call_z: float, units: list[tuple[float, dict]])
         return None
     with Image.open(MAP_FILE) as original:
         image = original.convert("RGB")
-    call_point = map_point(call_x, call_z)
+    visible_bounds = map_bounds(image)
+    call_point = map_point(call_x, call_z, visible_bounds)
     crop_size = 620
     half = crop_size // 2
-    # Keep the crop inside the actual ER:LC map, not the white transparent
-    # border around the supplied map PNG.
-    map_left, map_top, map_right, map_bottom = MAP_BOUNDS
-    left = max(map_left, min(map_right - crop_size, call_point[0] - half))
-    top = max(map_top, min(map_bottom - crop_size, call_point[1] - half))
-    cropped = image.crop((left, top, left + crop_size, top + crop_size)).resize((900, 900), Image.Resampling.LANCZOS)
+    # Keep the crop inside the actual ER:LC map, not its white border.  A map
+    # can be smaller than the preferred crop, so never calculate a negative edge.
+    map_left, map_top, map_right, map_bottom = visible_bounds
+    crop_width = min(crop_size, map_right - map_left)
+    crop_height = min(crop_size, map_bottom - map_top)
+    left = max(map_left, min(map_right - crop_width, call_point[0] - crop_width // 2))
+    top = max(map_top, min(map_bottom - crop_height, call_point[1] - crop_height // 2))
+    cropped = image.crop((left, top, left + crop_width, top + crop_height)).resize((900, 900), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(cropped)
-    scale = 900 / crop_size
+    scale_x = 900 / crop_width
+    scale_y = 900 / crop_height
 
     def marker(point: tuple[int, int], colour: str, radius: int) -> None:
-        x, y = (point[0] - left) * scale, (point[1] - top) * scale
+        x, y = (point[0] - left) * scale_x, (point[1] - top) * scale_y
         draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=colour, outline="white", width=4)
 
     for _, unit in units:
         coordinates = location_coordinates(unit.get("Location") or {})
         if coordinates:
-            marker(map_point(*coordinates), "#2878F0", 12)
+            marker(map_point(*coordinates, visible_bounds), "#2878F0", 12)
     marker(call_point, "#E53935", 18)
     draw.text((24, 24), "Emergency Call", fill="white", stroke_width=3, stroke_fill="black", font=ImageFont.load_default())
 
