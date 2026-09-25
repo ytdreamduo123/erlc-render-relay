@@ -699,6 +699,7 @@ def update_dispatch_mentions(webhook_url: str, message: dict, payload: dict, pla
                         component["content"] = replacement
                         changed = True
         if not changed:
+            app.logger.warning("000 mention update: no replacement was available for %s player(s); see Dock lookup results above.", len(seen))
             return
         endpoint = webhook_url.split("?", 1)[0].rstrip("/") + f"/messages/{message_id}"
         edit = {"components": updated["components"], "allowed_mentions": {"parse": []}}
@@ -708,6 +709,8 @@ def update_dispatch_mentions(webhook_url: str, message: dict, payload: dict, pla
         response = requests.patch(endpoint, params={"with_components": "true"}, json=edit, timeout=10)
         if not response.ok:
             app.logger.warning("Could not update 000 mentions: Discord HTTP %s.", response.status_code)
+        else:
+            app.logger.warning("000 Discord mentions updated successfully for message %s.", message_id)
     except Exception:
         app.logger.exception("000 call was delivered, but its account mentions could not be updated.")
     finally:
