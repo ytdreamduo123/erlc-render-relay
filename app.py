@@ -14,7 +14,14 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import requests
-from dock_links import member_label
+try:
+    from dock_links import member_label
+except ModuleNotFoundError as error:
+    if error.name != "dock_links":
+        raise
+    # A missing optional deployment file must not disable emergency dispatch.
+    def member_label(player: dict, **kwargs) -> str:
+        return str(player.get("Player") or "Unknown").rsplit(":", 1)[0].replace("@", "＠")
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from PIL import Image, ImageDraw, ImageFont
@@ -23,6 +30,10 @@ from flask import Flask, Response, jsonify, request, send_file
 
 
 app = Flask(__name__)
+
+
+class CallerLookupUnavailable(Exception):
+    """A player call could not yet be distinguished from an automated call."""
 
 # ER:LC's official Ed25519 public key (SPKI DER, base64 encoded).
 ERLC_PUBLIC_KEY = (
@@ -228,14 +239,37 @@ def player_display_name(player: dict) -> str:
     return str(player.get("Player") or "Unknown").rsplit(":", 1)[0]
 
 
+def dispatch_member_label(player: dict, deadline: float) -> str:
+    try:
+        return member_label(player, deadline=deadline)
+    except Exception:
+        app.logger.exception("Dock mention lookup failed; using the Roblox name for this call.")
+        return player_display_name(player).replace("@", "＠")
+
+
+def caller_from_id(caller_id: str, players: list[dict]) -> str:
+    """A known human ID is enough to post, even when username lookup fails."""
+    for player in players:
+        if str(player.get("Player") or "").rsplit(":", 1)[-1] == caller_id:
+            return player_display_name(player)
+    try:
+        response = requests.get(f"https://users.roblox.com/v1/users/{caller_id}", timeout=2)
+        response.raise_for_status()
+        username = response.json().get("name")
+        if username:
+            return str(username)
+    except (requests.RequestException, ValueError, AttributeError):
+        pass
+    return f"Roblox user {caller_id}"
+
+
 def emergency_caller_name(details: dict, players: list[dict]) -> str:
-    """Resolve the caller ID from ER:LC's active-call data to a Roblox name."""
+    """Resolve humans by ID first; only confirmed automated calls are skipped."""
     supplied = find_value(details, "caller", "player", "playerName", "username", default="")
+    if supplied and supplied.isdigit() and int(supplied) > 0:
+        return caller_from_id(supplied, players)
     if supplied and not supplied.isdigit():
         return supplied
-
-    # Some ER:LC player call events include the caller directly in `players`.
-    # Use it immediately instead of waiting for the active-call endpoint.
     event_players = details.get("players")
     if isinstance(event_players, list):
         for player in event_players:
@@ -243,50 +277,47 @@ def emergency_caller_name(details: dict, players: list[dict]) -> str:
                 name = find_value(player, "username", "player", "playerName", "name", default="")
                 if name and not name.isdigit():
                     return name
-            elif isinstance(player, str) and player and not player.isdigit():
-                return player
+                rid = find_value(player, "userId", "robloxId", "id", default="")
+            else:
+                rid = str(player)
+                if isinstance(player, str) and player and not player.isdigit():
+                    return player
+            if rid.isdigit() and int(rid) > 0:
+                return caller_from_id(rid, players)
 
     call_number = str(details.get("callNumber") or "")
     server_key = os.getenv("ERLC_SERVER_KEY", "").strip()
-    if not server_key or not call_number:
-        return "Anonymous caller"
-    # The webhook can arrive a fraction of a second before ER:LC exposes the
-    # same call through its server API. Retry briefly before treating it as an
-    # automated call.
-    for attempt in range(4):
+    if not server_key:
+        app.logger.error("Cannot identify 000 caller: ERLC_SERVER_KEY is missing on Render.")
+        raise CallerLookupUnavailable("ERLC_SERVER_KEY is not configured.")
+    if not call_number:
+        raise CallerLookupUnavailable("Emergency event has no caller or call number.")
+    # Retry a briefly delayed active-call record, but do not mistake API failure
+    # for an NPC call and acknowledge a real call without delivering it.
+    for attempt in range(2):
         try:
             response = requests.get(
-                ERLC_SERVER_URL,
-                headers={"server-key": server_key},
-                params={"EmergencyCalls": "true"},
-                timeout=4,
+                ERLC_SERVER_URL, headers={"server-key": server_key},
+                params={"EmergencyCalls": "true"}, timeout=3,
             )
+            if response.status_code == 429:
+                raise CallerLookupUnavailable("ER:LC caller lookup is rate limited.")
             response.raise_for_status()
-            calls = response.json().get("EmergencyCalls", [])
-        except (requests.RequestException, ValueError, AttributeError):
-            calls = []
-
+            calls = response.json().get("EmergencyCalls")
+            if not isinstance(calls, list):
+                raise CallerLookupUnavailable("ER:LC returned no emergency-call list.")
+        except (requests.RequestException, ValueError, AttributeError) as error:
+            raise CallerLookupUnavailable("ER:LC caller lookup failed.") from error
         for call in calls:
             if not isinstance(call, dict) or str(call.get("CallNumber") or "") != call_number:
                 continue
-            caller_id = str(call.get("Caller") or supplied or "")
-            for player in players:
-                if str(player.get("Player") or "").rsplit(":", 1)[-1] == caller_id:
-                    return player_display_name(player)
-            if caller_id.isdigit():
-                try:
-                    roblox_response = requests.get(
-                        f"https://users.roblox.com/v1/users/{caller_id}", timeout=4
-                    )
-                    roblox_response.raise_for_status()
-                    username = roblox_response.json().get("name")
-                    if username:
-                        return str(username)
-                except (requests.RequestException, ValueError, AttributeError):
-                    pass
-        if attempt < 3:
+            caller_id = str(call.get("Caller") or "")
+            if caller_id.isdigit() and int(caller_id) > 0:
+                return caller_from_id(caller_id, players)
+            return "Anonymous caller"  # Confirmed automated call: no human ID.
+        if attempt == 0:
             time.sleep(0.5)
-    return "Anonymous caller"
+    raise CallerLookupUnavailable("The new call is not visible in ER:LC's active-call list yet.")
 
 
 def location_coordinates(location: dict) -> tuple[float, float] | None:
@@ -561,19 +592,22 @@ def emergency_component_payload(
     call_number = find_value(details, "callNumber", default="Unknown")
     caller = caller_name or emergency_caller_name(details, players)
     caller_player = next((p for p in players if player_display_name(p).casefold() == caller.rsplit(":", 1)[0].casefold()), None)
-    caller_label = member_label(caller_player) if caller_player else caller
+    dock_deadline = time.monotonic() + 3
+    caller_label = dispatch_member_label(caller_player, dock_deadline) if caller_player else caller
     nearby_heading, _ = dispatch_unit_filter(team)
     try:
         call_x, call_z = (float(value) for value in details.get("position", [])[:2])
     except (TypeError, ValueError):
         call_x = call_z = 0.0
     units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
-    units = visible_map_units(call_x, call_z, units, location) if call_x or call_z else units
+    try:
+        units = visible_map_units(call_x, call_z, units, location) if call_x or call_z else units
+    except Exception:
+        app.logger.exception("Map filtering failed; retaining nearby units in the text card.")
     unit_text = "\n".join(
-        f"{member_label(unit)} - Postal {str((unit.get('Location') or {}).get('PostalCode') or 'Unknown')}"
+        f"{dispatch_member_label(unit, dock_deadline)} - Postal {str((unit.get('Location') or {}).get('PostalCode') or 'Unknown')}"
         for _, unit in units
     ) or "*No nearby units are visible on the map.*"
-    timestamp = int(record.get("timestamp") or datetime.now(timezone.utc).timestamp())
     app.logger.warning(
         "Map calibration: %s at ER:LC coordinates X=%s, Z=%s (%s).",
         caller,
@@ -581,7 +615,11 @@ def emergency_component_payload(
         call_z,
         location,
     )
-    map_image = emergency_map(call_x, call_z, units, caller, location) if call_x or call_z else None
+    try:
+        map_image = emergency_map(call_x, call_z, units, caller, location) if call_x or call_z else None
+    except Exception:
+        app.logger.exception("Map rendering failed; sending the 000 card without a map.")
+        map_image = None
 
     call_heading = "000 Call Closed" if event_name == "EmergencyCallEnded" else "000 Call Received"
     card_components = [
@@ -631,7 +669,7 @@ def discord_payload(data: dict) -> tuple[dict | None, io.BytesIO | None]:
         if caller != "Anonymous caller":
             return emergency_component_payload(record, players, caller)
         app.logger.warning(
-            "Skipped EmergencyCallStarted #%s: ER:LC did not expose a player caller yet.",
+            "Skipped EmergencyCallStarted #%s: active-call data confirmed no human caller.",
             details.get("callNumber", "unknown"),
         )
     return None, None
@@ -715,6 +753,9 @@ def erlc_events():
             )
         result.raise_for_status()
         app.logger.info("Posted a real player 911 call to Discord successfully.")
+    except CallerLookupUnavailable as error:
+        app.logger.warning("000 call not delivered yet: %s", error)
+        return jsonify(error=str(error)), 503
     except requests.RequestException:
         app.logger.exception("Unable to post ER:LC event to Discord.")
         return jsonify(error="Unable to deliver the event to Discord."), 502
