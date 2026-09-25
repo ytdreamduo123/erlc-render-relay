@@ -11,14 +11,17 @@ _next_request = 0.0
 _requests = deque()
 
 
-def discord_ids(roblox_id: str) -> list[str]:
+def discord_ids(roblox_id: str, *, deadline: float | None = None) -> list[str]:
     global _next_request
     token = os.getenv("DOCK_API_KEY", "").strip()
     guild_id = os.getenv("DISCORD_GUILD_ID", "1515128511206002859").strip()
     if not token or not roblox_id.isdigit():
         return []
     key = (guild_id, roblox_id)
-    with _lock:
+    remaining = max(0, deadline - time.monotonic()) if deadline is not None else 2
+    if not _lock.acquire(timeout=remaining):
+        return []
+    try:
         now = time.monotonic()
         cached = _cache.get(key)
         if cached and cached[0] > now:
@@ -26,7 +29,7 @@ def discord_ids(roblox_id: str) -> list[str]:
         while _requests and _requests[0] < now - 86400:
             _requests.popleft()
         # Reserve most Dock quota for the bot. No retry storms on relay events.
-        if len(_requests) >= 500 or _next_request - now > 2:
+        if (deadline is not None and max(now, _next_request) >= deadline) or len(_requests) >= 500 or _next_request - now > 2:
             return []
         if _next_request > now:
             time.sleep(_next_request - now)
@@ -36,7 +39,8 @@ def discord_ids(roblox_id: str) -> list[str]:
             response = requests.get(
                 "https://api.docksys.xyz/api/v1/public/roblox-to-discord",
                 headers={"Authorization": f"Bearer {token}"},
-                params={"robloxId": roblox_id, "guildId": guild_id}, timeout=2,
+                params={"robloxId": roblox_id, "guildId": guild_id},
+                timeout=max(0.05, min(2, (deadline - time.monotonic()) / 2)) if deadline is not None else 2,
             )
             if response.status_code == 429:
                 try:
@@ -58,12 +62,15 @@ def discord_ids(roblox_id: str) -> list[str]:
             _cache[key] = (time.monotonic() + 390, [])
             return []
 
+    finally:
+        _lock.release()
 
-def member_label(player: dict) -> str:
+
+def member_label(player: dict, *, deadline: float | None = None) -> str:
     value = str(player.get("Player") or "Unknown")
     name, sep, rid = value.rpartition(":")
     if not sep or not rid.isdigit():
         return value.replace("@", "＠")
-    ids = discord_ids(rid)
+    ids = discord_ids(rid, deadline=deadline)
     # Multiple linked accounts are ambiguous: do not ping an arbitrary member.
     return f"<@{ids[0]}>" if len(ids) == 1 else name.replace("@", "＠")
