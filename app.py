@@ -10,6 +10,9 @@ import json
 import math
 import os
 import time
+import copy
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -30,6 +33,8 @@ from flask import Flask, Response, jsonify, request, send_file
 
 
 app = Flask(__name__)
+DOCK_UPDATES = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dock-dispatch")
+DOCK_UPDATE_SLOTS = threading.BoundedSemaphore(16)
 
 
 class CallerLookupUnavailable(Exception):
@@ -592,7 +597,8 @@ def emergency_component_payload(
     call_number = find_value(details, "callNumber", default="Unknown")
     caller = caller_name or emergency_caller_name(details, players)
     caller_player = next((p for p in players if player_display_name(p).casefold() == caller.rsplit(":", 1)[0].casefold()), None)
-    dock_deadline = time.monotonic() + 3
+    # First delivery uses cached links only; fresh lookups update the sent card.
+    dock_deadline = time.monotonic()
     caller_label = dispatch_member_label(caller_player, dock_deadline) if caller_player else caller
     nearby_heading, _ = dispatch_unit_filter(team)
     try:
@@ -653,7 +659,59 @@ def emergency_component_payload(
         "flags": 32768,
         "allowed_mentions": {"parse": []},
         "components": [{"type": 17, "components": card_components}],
+        "_dock_players": ([caller_player] if caller_player else []) + [unit for _, unit in units],
     }, map_image
+
+
+def update_dispatch_mentions(webhook_url: str, message: dict, payload: dict, players: list[dict]) -> None:
+    """Resolve every relevant unit after delivery, without delaying the call."""
+    try:
+        if not os.getenv("DOCK_API_KEY", "").strip():
+            app.logger.warning("000 mentions unavailable: set DOCK_API_KEY on the Render relay service.")
+            return
+        message_id = str(message.get("id") or "")
+        if not message_id.isdigit():
+            return
+        updated = copy.deepcopy(payload)
+        seen = set()
+        changed = False
+        for player in players:
+            identity = str(player.get("Player") or "")
+            if identity in seen:
+                continue
+            seen.add(identity)
+            label = dispatch_member_label(player, time.monotonic() + 8)
+            if not label.startswith("<@"):
+                continue
+            fallback = player_display_name(player).replace("@", "＠")
+            for container in updated.get("components", []):
+                for component in container.get("components", []):
+                    text = component.get("content", "")
+                    replacement = text
+                    if "**Nearby Units:**" in text:
+                        replacement = "\n".join(
+                            label + line[len(fallback):] if line.startswith(fallback + " - Postal ") else line
+                            for line in text.split("\n")
+                        )
+                    elif "**<:ID1:1533361223922614292> Caller:** " in text:
+                        replacement = text.replace(f"Caller:** {fallback}\n", f"Caller:** {label}\n", 1)
+                    if replacement != text:
+                        component["content"] = replacement
+                        changed = True
+        if not changed:
+            return
+        endpoint = webhook_url.split("?", 1)[0].rstrip("/") + f"/messages/{message_id}"
+        edit = {"components": updated["components"], "allowed_mentions": {"parse": []}}
+        attachments = message.get("attachments", [])
+        if isinstance(attachments, list):
+            edit["attachments"] = [{"id": item["id"], "filename": item["filename"]} for item in attachments if isinstance(item, dict) and "id" in item and "filename" in item]
+        response = requests.patch(endpoint, params={"with_components": "true"}, json=edit, timeout=10)
+        if not response.ok:
+            app.logger.warning("Could not update 000 mentions: Discord HTTP %s.", response.status_code)
+    except Exception:
+        app.logger.exception("000 call was delivered, but its account mentions could not be updated.")
+    finally:
+        DOCK_UPDATE_SLOTS.release()
 
 
 def discord_payload(data: dict) -> tuple[dict | None, io.BytesIO | None]:
@@ -744,6 +802,7 @@ def erlc_events():
             # call, or a probe.  Accept it without posting anything to Discord.
             app.logger.info("Accepted an ER:LC event but did not post it: not a real player 911 call.")
             return Response(status=204)
+        dock_players = payload.pop("_dock_players", [])
         result = post_to_discord(webhook_url, payload, map_image)
         if not result.ok:
             app.logger.error(
@@ -752,6 +811,17 @@ def erlc_events():
                 result.text[:2000],
             )
         result.raise_for_status()
+        if dock_players:
+            try:
+                message = result.json()
+            except ValueError:
+                message = None
+            if isinstance(message, dict) and DOCK_UPDATE_SLOTS.acquire(blocking=False):
+                try:
+                    DOCK_UPDATES.submit(update_dispatch_mentions, webhook_url, message, payload, dock_players)
+                except RuntimeError:
+                    DOCK_UPDATE_SLOTS.release()
+                    app.logger.warning("000 mention worker is shutting down; original call remains delivered.")
         app.logger.info("Posted a real player 911 call to Discord successfully.")
     except CallerLookupUnavailable as error:
         app.logger.warning("000 call not delivered yet: %s", error)
