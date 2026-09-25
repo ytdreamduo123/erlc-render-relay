@@ -13,6 +13,10 @@ import time
 import copy
 import threading
 from concurrent.futures import ThreadPoolExecutor
+import time
+import copy
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -33,6 +37,117 @@ from flask import Flask, Response, jsonify, request, send_file
 
 
 app = Flask(__name__)
+DOCK_UPDATES = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dock-dispatch")
+DOCK_UPDATE_SLOTS = threading.BoundedSemaphore(16)
+# Dock matching is bundled here so deploying app.py alone includes it.
+import os
+import logging
+import threading
+import time
+from collections import deque
+import requests
+
+_cache = {}
+_lock = threading.Lock()
+_next_request = 0.0
+_requests = deque()
+DOCK_LOGGER = logging.getLogger("dispatch_dock")
+DOCK_LOGGER.setLevel(logging.INFO)
+if not DOCK_LOGGER.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s dock_links: %(message)s"))
+    DOCK_LOGGER.addHandler(handler)
+DOCK_LOGGER.propagate = False
+
+
+def discord_ids(roblox_id: str, *, deadline: float | None = None) -> list[str]:
+    global _next_request
+    token = os.getenv("DOCK_API_KEY", "").strip()
+    guild_id = os.getenv("DISCORD_GUILD_ID", "1515128511206002859").strip()
+    if not token:
+        DOCK_LOGGER.warning("Dock lookup skipped: DOCK_API_KEY is missing on this Render service.")
+        return []
+    if not roblox_id.isdigit():
+        DOCK_LOGGER.warning("Dock lookup skipped: invalid Roblox ID.")
+        return []
+    key = (guild_id, roblox_id)
+    remaining = max(0, deadline - time.monotonic()) if deadline is not None else 2
+    if not _lock.acquire(timeout=remaining):
+        return []
+    try:
+        now = time.monotonic()
+        cached = _cache.get(key)
+        if cached and cached[0] > now:
+            DOCK_LOGGER.info("Dock cached lookup: Roblox %s in guild %s has %s linked account(s).", roblox_id, guild_id, len(cached[1]))
+            return cached[1]
+        while _requests and _requests[0] < now - 86400:
+            _requests.popleft()
+        # Reserve most Dock quota for the bot. No retry storms on relay events.
+        if (deadline is not None and max(now, _next_request) >= deadline) or len(_requests) >= 500 or _next_request - now > 2:
+            return []
+        if _next_request > now:
+            time.sleep(_next_request - now)
+        _requests.append(time.monotonic())
+        _next_request = time.monotonic() + 2
+        try:
+            response = requests.get(
+                "https://api.docksys.xyz/api/v1/public/roblox-to-discord",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"robloxId": roblox_id, "guildId": guild_id},
+                timeout=max(0.05, min(2, (deadline - time.monotonic()) / 2)) if deadline is not None else 2,
+            )
+            if response.status_code == 429:
+                try:
+                    retry = max(2, float(response.headers.get("Retry-After", "60")))
+                except (ValueError, TypeError):
+                    retry = 60
+                _next_request = time.monotonic() + retry
+                return []
+            if response.status_code != 200:
+                DOCK_LOGGER.warning("Dock lookup for Roblox %s in guild %s returned HTTP %s.", roblox_id, guild_id, response.status_code)
+                _cache[key] = (time.monotonic() + (390 if response.status_code == 404 else 15), [])
+                return []
+            payload = response.json()
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            if not isinstance(data, dict) or str(data.get("robloxId")) != roblox_id or not isinstance(data.get("discordIds"), list):
+                DOCK_LOGGER.warning("Dock returned an unexpected response for Roblox %s; expected matching robloxId and a discordIds list.", roblox_id)
+                _cache[key] = (time.monotonic() + 15, [])
+                return []
+            ids = data["discordIds"]
+            ids = [str(value) for value in ids if str(value).isdigit()] if isinstance(ids, list) else []
+            ids = list(dict.fromkeys(ids))
+            DOCK_LOGGER.info("Dock lookup for Roblox %s in guild %s returned %s linked Discord account(s).", roblox_id, guild_id, len(ids))
+            _cache[key] = (time.monotonic() + (21600 if ids else 390), ids)
+            return ids
+        except (requests.RequestException, ValueError):
+            DOCK_LOGGER.warning("Dock lookup for Roblox %s failed temporarily.", roblox_id)
+            _cache[key] = (time.monotonic() + 15, [])
+            return []
+
+    finally:
+        _lock.release()
+
+
+def member_label(player: dict, *, deadline: float | None = None) -> str:
+    value = str(player.get("Player") or "Unknown")
+    name, sep, rid = value.rpartition(":")
+    name, rid = name.strip(), rid.strip()
+    if not sep or not rid.isdigit():
+        DOCK_LOGGER.warning("Cannot resolve a dispatch mention: ER:LC player value has no numeric Roblox ID.")
+        return value.replace("@", "＠")
+    ids = discord_ids(rid, deadline=deadline)
+    if len(ids) > 1:
+        DOCK_LOGGER.warning("Roblox %s has multiple linked Discord accounts; no unique mention can be selected.", rid)
+    # Multiple linked accounts are ambiguous: do not ping an arbitrary member.
+    return f"<@{ids[0]}>" if len(ids) == 1 else name.replace("@", "＠")
+
+
+app = Flask(__name__)
+app.logger.warning(
+    "000 relay build: bundled-dock-v1; Dock key configured=%s; guild=%s.",
+    bool(os.getenv("DOCK_API_KEY", "").strip()),
+    os.getenv("DISCORD_GUILD_ID", "1515128511206002859").strip(),
+)
 DOCK_UPDATES = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dock-dispatch")
 DOCK_UPDATE_SLOTS = threading.BoundedSemaphore(16)
 
@@ -240,6 +355,19 @@ def server_players() -> list[dict]:
         return []
 
 
+def player_display_name(player: dict) -> str:
+    return str(player.get("Player") or "Unknown").rsplit(":", 1)[0]
+
+
+def dispatch_member_label(player: dict, deadline: float) -> str:
+    try:
+        return member_label(player, deadline=deadline)
+    except Exception:
+        app.logger.exception("Dock mention lookup failed; using the Roblox name for this call.")
+        return player_display_name(player).replace("@", "＠")
+
+
+def caller_from_id(caller_id: str, players: list[dict]) -> str:
 def player_display_name(player: dict) -> str:
     return str(player.get("Player") or "Unknown").rsplit(":", 1)[0]
 
@@ -600,6 +728,9 @@ def emergency_component_payload(
     # First delivery uses cached links only; fresh lookups update the sent card.
     dock_deadline = time.monotonic()
     caller_label = dispatch_member_label(caller_player, dock_deadline) if caller_player else caller
+    # First delivery uses cached links only; fresh lookups update the sent card.
+    dock_deadline = time.monotonic()
+    caller_label = dispatch_member_label(caller_player, dock_deadline) if caller_player else caller
     nearby_heading, _ = dispatch_unit_filter(team)
     try:
         call_x, call_z = (float(value) for value in details.get("position", [])[:2])
@@ -611,6 +742,7 @@ def emergency_component_payload(
     except Exception:
         app.logger.exception("Map filtering failed; retaining nearby units in the text card.")
     unit_text = "\n".join(
+        f"{dispatch_member_label(unit, dock_deadline)} - Postal {str((unit.get('Location') or {}).get('PostalCode') or 'Unknown')}"
         f"{dispatch_member_label(unit, dock_deadline)} - Postal {str((unit.get('Location') or {}).get('PostalCode') or 'Unknown')}"
         for _, unit in units
     ) or "*No nearby units are visible on the map.*"
@@ -699,6 +831,63 @@ def update_dispatch_mentions(webhook_url: str, message: dict, payload: dict, pla
                         component["content"] = replacement
                         changed = True
         if not changed:
+            return
+        endpoint = webhook_url.split("?", 1)[0].rstrip("/") + f"/messages/{message_id}"
+        edit = {"components": updated["components"], "allowed_mentions": {"parse": []}}
+        attachments = message.get("attachments", [])
+        if isinstance(attachments, list):
+            edit["attachments"] = [{"id": item["id"], "filename": item["filename"]} for item in attachments if isinstance(item, dict) and "id" in item and "filename" in item]
+        response = requests.patch(endpoint, params={"with_components": "true"}, json=edit, timeout=10)
+        if not response.ok:
+            app.logger.warning("Could not update 000 mentions: Discord HTTP %s.", response.status_code)
+    except Exception:
+        app.logger.exception("000 call was delivered, but its account mentions could not be updated.")
+    finally:
+        DOCK_UPDATE_SLOTS.release()
+
+
+def discord_payload(data: dict) -> tuple[dict | None, io.BytesIO | None]:
+        "components": [{"type": 17, "components": card_components}],
+        "_dock_players": ([caller_player] if caller_player else []) + [unit for _, unit in units],
+    }, map_image
+
+
+def update_dispatch_mentions(webhook_url: str, message: dict, payload: dict, players: list[dict]) -> None:
+    """Resolve every relevant unit after delivery, without delaying the call."""
+    try:
+        if not os.getenv("DOCK_API_KEY", "").strip():
+            app.logger.warning("000 mentions unavailable: set DOCK_API_KEY on the Render relay service.")
+            return
+        message_id = str(message.get("id") or "")
+        if not message_id.isdigit():
+            return
+        updated = copy.deepcopy(payload)
+        seen = set()
+        changed = False
+        for player in players:
+            identity = str(player.get("Player") or "")
+            if identity in seen:
+                continue
+            seen.add(identity)
+            label = dispatch_member_label(player, time.monotonic() + 8)
+            if not label.startswith("<@"):
+                continue
+            fallback = player_display_name(player).replace("@", "＠")
+            for container in updated.get("components", []):
+                for component in container.get("components", []):
+                    text = component.get("content", "")
+                    replacement = text
+                    if "**Nearby Units:**" in text:
+                        replacement = "\n".join(
+                            label + line[len(fallback):] if line.startswith(fallback + " - Postal ") else line
+                            for line in text.split("\n")
+                        )
+                    elif "**<:ID1:1533361223922614292> Caller:** " in text:
+                        replacement = text.replace(f"Caller:** {fallback}\n", f"Caller:** {label}\n", 1)
+                    if replacement != text:
+                        component["content"] = replacement
+                        changed = True
+        if not changed:
             app.logger.warning("000 mention update: no replacement was available for %s player(s); see Dock lookup results above.", len(seen))
             return
         endpoint = webhook_url.split("?", 1)[0].rstrip("/") + f"/messages/{message_id}"
@@ -730,6 +919,7 @@ def discord_payload(data: dict) -> tuple[dict | None, io.BytesIO | None]:
         if caller != "Anonymous caller":
             return emergency_component_payload(record, players, caller)
         app.logger.warning(
+            "Skipped EmergencyCallStarted #%s: active-call data confirmed no human caller.",
             "Skipped EmergencyCallStarted #%s: active-call data confirmed no human caller.",
             details.get("callNumber", "unknown"),
         )
@@ -807,12 +997,27 @@ def erlc_events():
             return Response(status=204)
         dock_players = payload.pop("_dock_players", [])
         result = post_to_discord(webhook_url, payload, map_image)
+        dock_players = payload.pop("_dock_players", [])
+        result = post_to_discord(webhook_url, payload, map_image)
         if not result.ok:
             app.logger.error(
                 "Discord webhook rejected the payload (HTTP %s): %s",
                 result.status_code,
                 result.text[:2000],
             )
+        result.raise_for_status()
+        if dock_players:
+            try:
+                message = result.json()
+            except ValueError:
+                message = None
+            if isinstance(message, dict) and DOCK_UPDATE_SLOTS.acquire(blocking=False):
+                try:
+                    DOCK_UPDATES.submit(update_dispatch_mentions, webhook_url, message, payload, dock_players)
+                except RuntimeError:
+                    DOCK_UPDATE_SLOTS.release()
+                    app.logger.warning("000 mention worker is shutting down; original call remains delivered.")
+        app.logger.info("Posted a real player 911 call to Discord successfully.")
         result.raise_for_status()
         if dock_players:
             try:
