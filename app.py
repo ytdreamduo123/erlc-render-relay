@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import requests
+from dock_links import member_label
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from PIL import Image, ImageDraw, ImageFont
@@ -559,6 +560,8 @@ def emergency_component_payload(
     team = find_value(details, "team", default="Emergency Services")
     call_number = find_value(details, "callNumber", default="Unknown")
     caller = caller_name or emergency_caller_name(details, players)
+    caller_player = next((p for p in players if player_display_name(p).casefold() == caller.rsplit(":", 1)[0].casefold()), None)
+    caller_label = member_label(caller_player) if caller_player else caller
     nearby_heading, _ = dispatch_unit_filter(team)
     try:
         call_x, call_z = (float(value) for value in details.get("position", [])[:2])
@@ -567,7 +570,7 @@ def emergency_component_payload(
     units = nearby_units(players, call_x, call_z, team) if call_x or call_z else []
     units = visible_map_units(call_x, call_z, units, location) if call_x or call_z else units
     unit_text = "\n".join(
-        f"{player_display_name(unit)} - Postal {str((unit.get('Location') or {}).get('PostalCode') or 'Unknown')}"
+        f"{member_label(unit)} - Postal {str((unit.get('Location') or {}).get('PostalCode') or 'Unknown')}"
         for _, unit in units
     ) or "*No nearby units are visible on the map.*"
     timestamp = int(record.get("timestamp") or datetime.now(timezone.utc).timestamp())
@@ -580,14 +583,14 @@ def emergency_component_payload(
     )
     map_image = emergency_map(call_x, call_z, units, caller, location) if call_x or call_z else None
 
-    call_heading = "000 Call Closed" if event_name == "EmergencyCallEnded" else "000 Call Recieved"
+    call_heading = "000 Call Closed" if event_name == "EmergencyCallEnded" else "000 Call Received"
     card_components = [
         {"type": 10, "content": f"# {call_heading}: {team}"},
         {"type": 14, "spacing": 1, "divider": True},
         {
             "type": 10,
             "content": (
-                f"**<:ID1:1533361223922614292> Caller:** {caller}\n"
+                f"**<:ID1:1533361223922614292> Caller:** {caller_label}\n"
                 f"**<:rules:1516634223711092826> Incident:** {description}\n"
                 f"**<:location:1533361529783848960> Location:** {location}"
             ),
@@ -596,20 +599,21 @@ def emergency_component_payload(
         {"type": 10, "content": f"<:walkietalkie:1530913722376257636> **Nearby Units:**\n{unit_text}"},
     ]
     if map_image:
+        card_components.append({"type": 14, "spacing": 1, "divider": True})
         card_components.append(
             {
                 "type": 12,
-            "items": [{"media": {"url": "attachment://erlc_emergency_map.jpg"}}],
+                "items": [{"media": {"url": "attachment://erlc_emergency_map.jpg"}}],
             }
         )
         card_components.append({"type": 14, "spacing": 1, "divider": True})
-    card_components.append({"type": 14, "spacing": 1, "divider": True})
     card_components.append({"type": 10, "content": "-# Brisbane City Communication - 000 Emergency Dispatch"})
 
     return {
         "username": "Brisbane City Communications",
         "avatar_url": f"{RELAY_PUBLIC_URL}/brisbane-logo.png",
         "flags": 32768,
+        "allowed_mentions": {"parse": []},
         "components": [{"type": 17, "components": card_components}],
     }, map_image
 
