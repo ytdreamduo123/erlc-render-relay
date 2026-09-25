@@ -8,3 +8,7 @@ services:
     envVars:
       - key: DISCORD_WEBHOOK_URL
         sync: false
+      - key: DOCK_API_KEY
+        sync: false
+      - key: DISCORD_GUILD_ID
+        value: "1515128511206002859"
