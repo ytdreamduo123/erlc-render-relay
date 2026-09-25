@@ -13,6 +13,12 @@ _next_request = 0.0
 _requests = deque()
 _requests = deque()
 LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
+if not LOGGER.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s dock_links: %(message)s"))
+    LOGGER.addHandler(handler)
+LOGGER.propagate = False
 
 
 def discord_ids(roblox_id: str, *, deadline: float | None = None) -> list[str]:
@@ -29,6 +35,9 @@ def discord_ids(roblox_id: str, *, deadline: float | None = None) -> list[str]:
         now = time.monotonic()
         cached = _cache.get(key)
         if cached and cached[0] > now:
+            return cached[1]
+        if cached and cached[0] > now:
+            LOGGER.info("Dock cached lookup: Roblox %s in guild %s has %s linked account(s).", roblox_id, guild_id, len(cached[1]))
             return cached[1]
         while _requests and _requests[0] < now - 86400:
             _requests.popleft()
@@ -62,8 +71,13 @@ def discord_ids(roblox_id: str, *, deadline: float | None = None) -> list[str]:
                 return []
             payload = response.json()
             data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            if not isinstance(data, dict) or str(data.get("robloxId")) != roblox_id or not isinstance(data.get("discordIds"), list):
+                LOGGER.warning("Dock returned an unexpected response for Roblox %s; expected matching robloxId and a discordIds list.", roblox_id)
+                _cache[key] = (time.monotonic() + 15, [])
+                return []
             ids = data.get("discordIds", []) if isinstance(data, dict) and str(data.get("robloxId")) == roblox_id else []
             ids = [str(value) for value in ids if str(value).isdigit()] if isinstance(ids, list) else []
+            ids = data["discordIds"]
             ids = [str(value) for value in ids if str(value).isdigit()] if isinstance(ids, list) else []
             ids = list(dict.fromkeys(ids))
             LOGGER.info("Dock lookup for Roblox %s in guild %s returned %s linked Discord account(s).", roblox_id, guild_id, len(ids))
@@ -86,5 +100,13 @@ def member_label(player: dict, *, deadline: float | None = None) -> str:
     if not sep or not rid.isdigit():
         return value.replace("@", "＠")
     ids = discord_ids(rid, deadline=deadline)
+    name, sep, rid = value.rpartition(":")
+    name, rid = name.strip(), rid.strip()
+    if not sep or not rid.isdigit():
+        LOGGER.warning("Cannot resolve a dispatch mention: ER:LC player value has no numeric Roblox ID.")
+        return value.replace("@", "＠")
+    ids = discord_ids(rid, deadline=deadline)
+    if len(ids) > 1:
+        LOGGER.warning("Roblox %s has multiple linked Discord accounts; no unique mention can be selected.", rid)
     # Multiple linked accounts are ambiguous: do not ping an arbitrary member.
     return f"<@{ids[0]}>" if len(ids) == 1 else name.replace("@", "＠")
