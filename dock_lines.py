@@ -1,5 +1,7 @@
 """Paced, cached Dock reverse lookups for dispatch mentions."""
 import os
+import os
+import logging
 import threading
 import time
 from collections import deque
@@ -9,6 +11,8 @@ _cache = {}
 _lock = threading.Lock()
 _next_request = 0.0
 _requests = deque()
+_requests = deque()
+LOGGER = logging.getLogger(__name__)
 
 
 def discord_ids(roblox_id: str, *, deadline: float | None = None) -> list[str]:
@@ -52,14 +56,24 @@ def discord_ids(roblox_id: str, *, deadline: float | None = None) -> list[str]:
             if response.status_code != 200:
                 _cache[key] = (time.monotonic() + 390, [])
                 return []
+            if response.status_code != 200:
+                LOGGER.warning("Dock lookup for Roblox %s in guild %s returned HTTP %s.", roblox_id, guild_id, response.status_code)
+                _cache[key] = (time.monotonic() + (390 if response.status_code == 404 else 15), [])
+                return []
             payload = response.json()
             data = payload.get("data", {}) if isinstance(payload, dict) else {}
             ids = data.get("discordIds", []) if isinstance(data, dict) and str(data.get("robloxId")) == roblox_id else []
             ids = [str(value) for value in ids if str(value).isdigit()] if isinstance(ids, list) else []
+            ids = [str(value) for value in ids if str(value).isdigit()] if isinstance(ids, list) else []
+            ids = list(dict.fromkeys(ids))
+            LOGGER.info("Dock lookup for Roblox %s in guild %s returned %s linked Discord account(s).", roblox_id, guild_id, len(ids))
             _cache[key] = (time.monotonic() + (21600 if ids else 390), ids)
             return ids
         except (requests.RequestException, ValueError):
             _cache[key] = (time.monotonic() + 390, [])
+        except (requests.RequestException, ValueError):
+            LOGGER.warning("Dock lookup for Roblox %s failed temporarily.", roblox_id)
+            _cache[key] = (time.monotonic() + 15, [])
             return []
 
     finally:
